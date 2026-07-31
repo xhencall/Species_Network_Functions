@@ -1430,7 +1430,7 @@ class QuartetFeature:
             sp_relation = QuartetFeature.get_site_pattern_relationship(qt_feat.taxa_perm)
 
             # 3. Compute site pattern probabilities (symmetric / asymmetric)
-            p_Qt = qt_feat.topology.get_true_probs(tau1, tau2, tau3, theta, 4 / 3)
+            p_Qt = qt_feat.topology.get_true_probs(tau1, tau2, tau3, theta, alpha)
             all_p_Qt.append(p_Qt[sp_relation])  # Append site pattern probabilities with site pattern mapping applied
 
         # 4. Normalize gamma weights & compute TrueProbs
@@ -1462,9 +1462,9 @@ class PairedQuartetFeature:
 
 
 
-######################################################
-## Get site pattern counts of data and each quartet ##
-######################################################
+########################################################
+## Get site pattern counts of data and of each quartet ##
+########################################################
 
 def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_missing=False):
     """Get the observed site pattern counts n^D in data and corresponding site pattern ID."""
@@ -1524,7 +1524,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
 
         return code
 
-    def expand_weighted_SitePattern(site, ACGT_weight):
+    def expand_weighted_site_pattern(site, ACGT_weight):
         """
         Expand a site pattern with ambiguity code into list of possible site patterns with weight proportions.
         This function allows ambiguity code for site pattern counting.
@@ -1557,16 +1557,16 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
         nucleotide_options = [ambiguity_code_map[char] for char in site]
 
         # Generate all combinations using product
-        expanded_SitePatterns = [np.array(site) for site in product(*nucleotide_options)]
+        expanded_site_patterns = [np.array(site) for site in product(*nucleotide_options)]
 
         # Calculate the weight of each pattern using the fast lookup dictionary
-        SitePattern_weights = np.prod(
-            [[weight_map[nuc] for nuc in site_pattern] for site_pattern in expanded_SitePatterns],
+        site_pattern_weights = np.prod(
+            [[weight_map[nuc] for nuc in site_pattern] for site_pattern in expanded_site_patterns],
             axis=1
         )
-        SitePattern_weight_proportions = SitePattern_weights / SitePattern_weights.sum()
+        site_pattern_weight_proportions = site_pattern_weights / site_pattern_weights.sum()
 
-        return zip(expanded_SitePatterns, SitePattern_weight_proportions)
+        return zip(expanded_site_patterns, site_pattern_weight_proportions)
 
     # --- Vectorized Pre-processing of Gaps and Missing Data ---
     # Create a boolean mask of which sites to keep
@@ -1591,7 +1591,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
 
     for unique_site, count in zip(filtered_sites, filtered_counts):
         # Task 1: Expand each unique site (w/ ambiguity code) into list of possible sites (w/o ambiguity) with weight proportions.
-        for site, weight in expand_weighted_SitePattern(unique_site, ACGT_weight):
+        for site, weight in expand_weighted_site_pattern(unique_site, ACGT_weight):
             # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as dict_key.
             key_IDcode = tuple(site_pattern_IDcode(site))
 
@@ -1605,9 +1605,9 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
     return collapsed_IDcode, collapsed_n_D
 
 
-def get_quartet_SitePatternCount_MapMatrix(quartet_sites, collapsed_SitePattern_count):
+def get_quartet_site_pattern_count_map_matrix(quartet_sites, collapsed_site_pattern_count):
     """
-    Count 15 category site patterns of a quartet from collapsed_SitePattern_count and generate a mapping matrix
+    Count 15 category site patterns of a quartet from collapsed_site_pattern_count and generate a mapping matrix
     from site pattern counts of data (n^D) to quartet site pattern counts (n^Q).
     xxxx - 0
     xxxy - 1
@@ -1641,16 +1641,16 @@ def get_quartet_SitePatternCount_MapMatrix(quartet_sites, collapsed_SitePattern_
     site_pattern_counts = np.zeros(15)
 
     # Maps from the site pattern counts of data to the 15 category site pattern counts
-    mapping_matrix = np.matrix(np.zeros((15,len(collapsed_SitePattern_count)), dtype=int))
+    mapping_matrix = np.matrix(np.zeros((15,len(collapsed_site_pattern_count)), dtype=int))
 
     # 15 category site pattern counts: unique sites (quartet_unique_site) and collapsed counts (quartet_unique_site_count).
     # Mapping matrix: the inverse indices of the unique sites (quartet_unique_site_InvIndex)
     (quartet_unique_site, quartet_unique_site_count,
-     quartet_unique_site_InvIndex) = get_quartet_unique_sites(quartet_sites, collapsed_SitePattern_count)
+     quartet_unique_site_InvIndex) = get_quartet_unique_sites(quartet_sites, collapsed_site_pattern_count)
 
     for j, unique_site in enumerate(quartet_unique_site):
         # For the j^th unique site, "np.where(quartet_unique_site_InvIndex == j)[0]" gives the vector of indices of
-        # where this unique site appears in its original collapsed_SitePattern_count.
+        # where this unique site appears in its original collapsed_site_pattern_count.
 
         # unique_site = np.array(['A', 'T', 'A', 'C']) # Example site for testing
         repeated_nucleo_count = len(np.unique(unique_site))
@@ -1832,7 +1832,7 @@ def get_zippedData_net_reduced(seq_data, phylox_network, major_tree,
     # -------------------------------------------------------------------------
     # 3. Dictionary accumulation to collapse quartets with identical quartet features
     # -------------------------------------------------------------------------
-    dict_SitePattern_count = defaultdict(int)
+    dict_site_pattern_count = defaultdict(int)
     dict_param_idx = {}
     dict_is_asymm = {}
     dict_taxa_perm = {}
@@ -1858,13 +1858,13 @@ def get_zippedData_net_reduced(seq_data, phylox_network, major_tree,
         quartet_sites = collapsed_IDcode[:, row_idx]
 
         # Get n_Q and its mapping matrix E_mat such that n_Q = E_mat @ n_D
-        n_Q, E_mat = get_quartet_SitePatternCount_MapMatrix(quartet_sites, n_D)
+        n_Q, E_mat = get_quartet_site_pattern_count_map_matrix(quartet_sites, n_D)
 
         # Convert everything to immutable tuples
         dict_key = make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id)
 
         ## Use quartet features as key to get reduced quartet site pattern counts.
-        dict_SitePattern_count[dict_key] += n_Q
+        dict_site_pattern_count[dict_key] += n_Q
         dict_param_idx[dict_key]    = param_idx
         dict_is_asymm[dict_key]      = is_asymm
         dict_taxa_perm[dict_key]     = taxa_perm
@@ -1874,14 +1874,14 @@ def get_zippedData_net_reduced(seq_data, phylox_network, major_tree,
     # -------------------------------------------------------------------------
     # 4. Output exported reduced quartet information
     # -------------------------------------------------------------------------
-    reduced_SitePattern_count   = np.array(list(dict_SitePattern_count.values()))
+    reduced_site_pattern_count   = np.array(list(dict_site_pattern_count.values()))
     reduced_param_idx           = list(dict_param_idx.values())
     reduced_is_asymm             = list(dict_is_asymm.values())
     reduced_taxa_perm            = list(dict_taxa_perm.values())
     reduced_gamma_id            = list(dict_gamma_id.values())
     reduced_E_mat               = list(dict_E_mat.values())
 
-    return (list(zip(reduced_SitePattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
+    return (list(zip(reduced_site_pattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
             reduced_E_mat, n_D)
 
 
@@ -1893,7 +1893,7 @@ def compress_zippedData_net(zipped_data_net, all_E_mat, n_D):
     import numpy as np
     from collections import defaultdict
 
-    dict_SitePattern_count = defaultdict(int)
+    dict_site_pattern_count = defaultdict(int)
     dict_param_idx = {}
     dict_is_asymm = {}
     dict_taxa_perm = {}
@@ -1919,7 +1919,7 @@ def compress_zippedData_net(zipped_data_net, all_E_mat, n_D):
         dict_key = make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id)
 
         # Use quartet features as key to get reduced quartet site pattern counts.
-        dict_SitePattern_count[dict_key] += n_Q
+        dict_site_pattern_count[dict_key] += n_Q
         dict_param_idx[dict_key] = param_idx
         dict_is_asymm[dict_key] = is_asymm
         dict_taxa_perm[dict_key] = taxa_perm
@@ -1929,14 +1929,14 @@ def compress_zippedData_net(zipped_data_net, all_E_mat, n_D):
     # -------------------------------------------------------------------------
     # Output exported reduced quartet information
     # -------------------------------------------------------------------------
-    reduced_SitePattern_count = np.array(list(dict_SitePattern_count.values()))
+    reduced_site_pattern_count = np.array(list(dict_site_pattern_count.values()))
     reduced_param_idx = list(dict_param_idx.values())
     reduced_is_asymm = list(dict_is_asymm.values())
     reduced_taxa_perm = list(dict_taxa_perm.values())
     reduced_gamma_id = list(dict_gamma_id.values())
     reduced_E_mat = list(dict_E_mat.values())
 
-    return (list(zip(reduced_SitePattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
+    return (list(zip(reduced_site_pattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
             reduced_E_mat, n_D)
 
 
@@ -1976,7 +1976,7 @@ def get_zippedData_net(seq_data, phylox_network, major_tree,
         quartet_sites = collapsed_IDcode[:, row_idx]
 
         # Get n_Q and its mapping matrix E_mat such that n_Q = E_mat @ n_D
-        n_Q, E_mat = get_quartet_SitePatternCount_MapMatrix(quartet_sites, n_D)
+        n_Q, E_mat = get_quartet_site_pattern_count_map_matrix(quartet_sites, n_D)
 
         all_n_Q.append(n_Q)
         all_param_idx.append(param_idx)
