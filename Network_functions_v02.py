@@ -15,9 +15,7 @@ from phylox.constants import LABEL_ATTR
 from phylox import suppress_node
 from dataclasses import dataclass
 from itertools import combinations, product
-
-# my_net = SpeciesNetwork(phylox_network)
-# my_major = SpeciesNetwork(major_tree)
+from abc import ABC, abstractmethod
 
 ############################################
 ## Class for phylox network manipulation  ##
@@ -207,7 +205,7 @@ class SpeciesNetwork:
 
         # Get the speciation time index labeled on speciation_nodes by pre-order traversal
         try:
-            return np.array([self.get_label_from_node(node) for node in speciation_nodes])
+            return np.array([self.get_label_from_node(node) for node in speciation_nodes], dtype=int)
         except (KeyError, AttributeError) as e:
             raise ValueError(
                 f"Failed to get speciation time indices (param_idx) from input network. "
@@ -560,9 +558,8 @@ class SpeciesNetwork:
 
         for taxa_comb in four_taxa_combs:
             # Use param_idx as dict key to deduplicates identical quartets and store other features in dict
-            dict_is_asymm = {}
-            dict_taxa_perm = {}
-            dict_gamma_id = {}
+            unique_tree_features = {}
+
             # Pre-convert the tuple to a list once per quartet
             taxa_list = list(taxa_comb)
 
@@ -575,20 +572,26 @@ class SpeciesNetwork:
                 quartet_network.erase_all_node_labels()
 
                 # Use param_idx as key to store other features
-                dict_key = tuple(labeled_quartet.get_parameter_idx())
-                is_asymm = labeled_quartet.is_asymmetric_quartet()
+                param_idx = labeled_quartet.get_parameter_idx()
+                dict_key = tuple(param_idx)
+                is_asymm = AsymmQuartet() if labeled_quartet.is_asymmetric_quartet() else SymmQuartet()
 
-                dict_is_asymm[dict_key] = is_asymm
                 # Only sort the asymmetric quartet
-                dict_taxa_perm[dict_key] = quartet_network.sorting_asymmetric_quartet() if is_asymm else [0, 1, 2, 3]
-                dict_gamma_id[dict_key] = gamma_id
+                taxa_perm = quartet_network.sorting_asymmetric_quartet() if is_asymm else [0, 1, 2, 3]
+
+                qt_feature = QuartetTreeFeature(
+                    param_idx   =   param_idx,
+                    topology    =   is_asymm,
+                    taxa_perm   =   taxa_perm,
+                    gamma_id    =   gamma_id
+                )
+
+                unique_tree_features[dict_key] = qt_feature
+
             # Create a structured QuartetFeature object
             q_feature = QuartetFeature(
                 taxa = taxa_comb,
-                param_idx = np.array(list(dict_is_asymm.keys())),
-                is_asymm = np.array(list(dict_is_asymm.values())),
-                taxa_perm = np.array(list(dict_taxa_perm.values())),
-                gamma_id = np.array(list(dict_gamma_id.values()))
+                tree_features = list(unique_tree_features.values())
             )
             quartet_features_list.append(q_feature)
 
@@ -665,71 +668,6 @@ class SpeciesNetwork:
 
         # Step 5: Convert aggregated dictionary to container object
         return list(dict_paired_feature.values())
-
-
-##################################################################################################
-## Quartet subnetworks are saved as quartet features (param_idx, is_asymm, taxa_perm, gamma_id) ##
-##################################################################################################
-
-@dataclass
-class QuartetFeature:
-    """Encapsulates quartet features (param_idx, is_asymm, taxa_perm, gamma_id) for a 4-taxa subnetwork."""
-    taxa: tuple
-    param_idx: np.ndarray
-    is_asymm: np.ndarray
-    taxa_perm: np.ndarray
-    gamma_id: np.ndarray
-
-    def to_dict(self):
-        """Helper to convert to a dictionary if matrix format is needed for downstream models."""
-        return {
-            "param_idx": self.param_idx,
-            "is_asymm": self.is_asymm,
-            "taxa_perm": self.taxa_perm,
-            "gamma_id": self.gamma_id
-        }
-
-@dataclass
-class PairedQuartetFeature:
-    """Encapsulates paired seq_data_rows with quartet features (param_idx, is_asymm, taxa_perm, gamma_id)"""
-    seq_data_rows: np.ndarray
-    quartet_feature: QuartetFeature
-
-    def __getattr__(self, name: str):
-        """
-        If an attribute or method isn't found on SpeciesNetwork, Python automatically redirects the call to
-        self.phylox_network.
-        For example, we set my_net = SpeciesNetwork(phylox_network).
-            If you type my_net.nodes, Python sets name = "nodes".
-            If you type my_net.successors(node), Python sets name = "successors".
-            If you type my_net.leaves, Python sets name = "leaves".
-        """
-        return getattr(self.quartet_feature, name)
-
-    @property
-    def taxa(self):
-        """Delegates taxa directly to the underlying QuartetFeature."""
-        return self.quartet_feature.taxa
-
-    @property
-    def param_idx(self):
-        """Delegates param_idx directly to the underlying QuartetFeature."""
-        return self.quartet_feature.param_idx
-
-    @property
-    def is_asymm(self):
-        """Delegates is_asymm directly to the underlying QuartetFeature."""
-        return self.quartet_feature.is_asymm
-
-    @property
-    def taxa_perm(self):
-        """Delegates taxa_perm directly to the underlying QuartetFeature."""
-        return self.quartet_feature.taxa_perm
-
-    @property
-    def gamma_id(self):
-        """Delegates gamma_id directly to the underlying QuartetFeature."""
-        return self.quartet_feature.gamma_id
 
 
 ###########################################################################
@@ -912,542 +850,616 @@ class NetworkParameters:
         """Flattens back into a combined parameter array if required by optimization solvers."""
         return np.concatenate([self.tree.values, self.gamma.values])
 
-########################################################################
-## Get true site pattern probabilities given the quartet features ##
-########################################################################
 
-def identify_sitePattern_index(site_pattern):
-    """Given an input site pattern with length four, identify the corresponding index."""
+#################################################################################################
+## Use polymorphism of OOP to bypass "if is_asymm:" for getTrueProbs of symm and asymm quartet ##
+#################################################################################################
 
-    from collections import Counter
+class QuartetTreeTopology(ABC):
+    """Abstract Strategy representing is_asymm of a 4-taxa subtree."""
 
-    # site_pattern = np.array(['A', 'A', 'A', 'C']) # Example site for testing
-    repeated_nucleo_count = len(np.unique(site_pattern))
-    if repeated_nucleo_count == 1:
+    @abstractmethod
+    def get_true_probs(self, t1: float, t2: float, t3: float, theta: float, alpha: float = 4 / 3):
+        """Computes 15-category site pattern probabilities for this quartet subtree."""
+        pass
+
+class AsymmQuartet(QuartetTreeTopology):
+    """Asymmetric Quartet Topology Strategy: (A,(B,(C,D)))"""
+
+    def get_true_probs(self, myt1: float, myt2: float, myt3: float, theta: float, alpha: float = 4 / 3):
+        # For an asymmetric quartet (A,(B,(C,D))), "label_speciation_time_idx" will label [1,2,3] in preorder traversal.
+        # /--------------------------------------------------------------------------- A
+        # + param_idx = 1
+        # |                        /-------------------------------------------------- B
+        # \------------------------+ param_idx = 2
+        # :                        |                        /------------------------- C
+        # :                        \------------------------+ param_idx = 3
+        # :                        :                        \------------------------- D
+        # tau3                     tau2                     tau1 (as in Chifman & Kubatko 2015)
+        #
+        # myt1 = Speciation time of taxa C,D
+        # myt2 = Speciation time of taxa B,C,D
+        # myt3 = Root age
+        # These get us the site pattern frequencies that match the data sets generated by the seq-gen
+        # pipeline that is commonly used in simulation studies.
+        # the order of the site patterns is as in the headings in Table 1 in the Supplement to Chifman and Kubatko (2015):
         # xxxx - 0
-        sitePattern_idx = 0
-    elif repeated_nucleo_count == 2:
-        # store the unique nucleotides with corresponding counts in a site
-        unique_nucleo = Counter(site_pattern)
-        if max(unique_nucleo.values()) == 3:
-            least_freq_nucleo = min(unique_nucleo, key=unique_nucleo.get)
-            locations = np.where(site_pattern == least_freq_nucleo)[0][0]  # location of least frequent nucleotide
-            # xxxy - 1. Least frequent nucleotide location is 3
-            # xxyx - 2. Least frequent nucleotide location is 2
-            # xyxx - 3. Least frequent nucleotide location is 1
-            # yxxx - 4. Least frequent nucleotide location is 0
-            sitePattern_idx = int(4 - locations)
-        else:  # elif max(unique_nucleo.values()) == 2:
-            locations = np.where(site_pattern == site_pattern[0])[0][1]
-            if locations == 2:
-                # xyxy - 5. Second appearance of the first nucleotide (x) is location 2
-                sitePattern_idx = 5
-            elif locations == 3:
-                # yxxy - 6. Second appearance of the first nucleotide (y) is location 3
-                sitePattern_idx = 6
-            else:  # elif locations == 1:
-                # xxyy - 7. Second appearance of the first nucleotide (x) is location 1
-                sitePattern_idx = 7
-    elif repeated_nucleo_count == 3:
-        unique_nucleo = Counter(site_pattern)
-        most_freq_nucleo = max(unique_nucleo, key=unique_nucleo.get)
-        locations = np.where(site_pattern == most_freq_nucleo)[0]
-        if np.all(locations == [0, 2]):
-            # xyxz - 8. Most frequent nucleotide location is [0,2]
-            sitePattern_idx = 8
-        elif np.all(locations == [0, 3]):
-            # xyzx - 9. Most frequent nucleotide location is [0,3]
-            sitePattern_idx = 9
-        elif np.all(locations == [1, 2]):
-            # yxxz - 10. Most frequent nucleotide location is [1,2]
-            sitePattern_idx = 10
-        elif np.all(locations == [1, 3]):
-            # yxzx - 11. Most frequent nucleotide location is [1,3]
-            sitePattern_idx = 11
-        elif np.all(locations == [0, 1]):
-            # xxyz - 12. Most frequent nucleotide location is [0,1]
-            sitePattern_idx = 12
-        else:  # elif np.all(locations == [2,3]):
-            # yzxx - 13. Most frequent nucleotide location is [2,3]
-            sitePattern_idx = 13
-    else:  # elif repeated_nucleo_count == 4:
-        # xyzw - 14
-        sitePattern_idx = 14
+        # xxxy = xxyx - 1
+        # xyxx - 2
+        # yxxx - 3
+        # xxyy - 4
+        # xyxy = yxxy - 5
+        # xxyz - 6
+        # yzxx - 7
+        # xyxz = xyzx - 8
+        # yxxz = yxzx - 9
+        # xyzw - 10
 
-    return sitePattern_idx
-
-
-def get_sitePattern_relationship(taxa_perm, inverse: bool = False):
-    """
-    Get the site pattern relationship vector (a list that permutes the indexing of the 15 category site pattern)
-    given the taxa permutation from the quartet feature.
-    """
-    # # Below are codes for generating the dict_relationship mapping.
-    # import numpy as np
-    # import itertools
-    # index_to_pattern = np.array([
-    #     ["x", "x", "x", "x"],  # 0
-    #     ["x", "x", "x", "y"],  # 1
-    #     ["x", "x", "y", "x"],  # 2
-    #     ["x", "y", "x", "x"],  # 3
-    #     ["y", "x", "x", "x"],  # 4
-    #     ["x", "y", "x", "y"],  # 5
-    #     ["y", "x", "x", "y"],  # 6
-    #     ["x", "x", "y", "y"],  # 7
-    #     ["x", "y", "x", "z"],  # 8
-    #     ["x", "y", "z", "x"],  # 9
-    #     ["y", "x", "x", "z"],  # 10
-    #     ["y", "x", "z", "x"],  # 11
-    #     ["x", "x", "y", "z"],  # 12
-    #     ["y", "z", "x", "x"],  # 13
-    #     ["x", "y", "z", "w"]   # 14
-    # ])
-    # dict_relationship = {
-    # perm: [identify_sitePattern_index(sp)
-    #        for sp in index_to_pattern[:, perm]]
-    # for perm in itertools.permutations([0, 1, 2, 3])
-    # }
-
-    # For each taxa permutation, get the site pattern relationship from dict_relationship
-    dict_relationship = {
-     (0, 1, 2, 3): [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
-     (0, 1, 3, 2): [0, 2, 1, 3, 4, 6, 5, 7, 9, 8, 11, 10, 12, 13, 14],
-     (0, 2, 1, 3): [0, 1, 3, 2, 4, 7, 6, 5, 12, 9, 10, 13, 8, 11, 14],
-     (0, 2, 3, 1): [0, 2, 3, 1, 4, 7, 5, 6, 12, 8, 11, 13, 9, 10, 14],
-     (0, 3, 1, 2): [0, 3, 1, 2, 4, 6, 7, 5, 9, 12, 13, 10, 8, 11, 14],
-     (0, 3, 2, 1): [0, 3, 2, 1, 4, 5, 7, 6, 8, 12, 13, 11, 9, 10, 14],
-     (1, 0, 2, 3): [0, 1, 2, 4, 3, 6, 5, 7, 10, 11, 8, 9, 12, 13, 14],
-     (1, 0, 3, 2): [0, 2, 1, 4, 3, 5, 6, 7, 11, 10, 9, 8, 12, 13, 14],
-     (1, 2, 0, 3): [0, 1, 3, 4, 2, 6, 7, 5, 10, 13, 12, 9, 8, 11, 14],
-     (1, 2, 3, 0): [0, 2, 3, 4, 1, 5, 7, 6, 11, 13, 12, 8, 9, 10, 14],
-     (1, 3, 0, 2): [0, 3, 1, 4, 2, 7, 6, 5, 13, 10, 9, 12, 8, 11, 14],
-     (1, 3, 2, 0): [0, 3, 2, 4, 1, 7, 5, 6, 13, 11, 8, 12, 9, 10, 14],
-     (2, 0, 1, 3): [0, 1, 4, 2, 3, 7, 5, 6, 12, 11, 8, 13, 10, 9, 14],
-     (2, 0, 3, 1): [0, 2, 4, 1, 3, 7, 6, 5, 12, 10, 9, 13, 11, 8, 14],
-     (2, 1, 0, 3): [0, 1, 4, 3, 2, 5, 7, 6, 8, 13, 12, 11, 10, 9, 14],
-     (2, 1, 3, 0): [0, 2, 4, 3, 1, 6, 7, 5, 9, 13, 12, 10, 11, 8, 14],
-     (2, 3, 0, 1): [0, 3, 4, 1, 2, 5, 6, 7, 8, 10, 9, 11, 13, 12, 14],
-     (2, 3, 1, 0): [0, 3, 4, 2, 1, 6, 5, 7, 9, 11, 8, 10, 13, 12, 14],
-     (3, 0, 1, 2): [0, 4, 1, 2, 3, 5, 7, 6, 11, 12, 13, 8, 10, 9, 14],
-     (3, 0, 2, 1): [0, 4, 2, 1, 3, 6, 7, 5, 10, 12, 13, 9, 11, 8, 14],
-     (3, 1, 0, 2): [0, 4, 1, 3, 2, 7, 5, 6, 13, 8, 11, 12, 10, 9, 14],
-     (3, 1, 2, 0): [0, 4, 2, 3, 1, 7, 6, 5, 13, 9, 10, 12, 11, 8, 14],
-     (3, 2, 0, 1): [0, 4, 3, 1, 2, 6, 5, 7, 10, 8, 11, 9, 13, 12, 14],
-     (3, 2, 1, 0): [0, 4, 3, 2, 1, 5, 6, 7, 11, 9, 10, 8, 13, 12, 14]}
-
-    if inverse:
-        return dict_relationship[tuple(np.argsort(taxa_perm))]
-    else:
-        return dict_relationship[tuple(taxa_perm)]
-
-
-def get_sitePattern_map_matrix(taxa_perm, inverse: bool = False):
-    """
-    Get the site pattern mapping matrix (a linear transformation matrix that permutes the 15 categories site pattern
-    by matrix multiplication) given the taxa permutation from the quartet feature.
-    """
-
-    relationship = get_sitePattern_relationship(taxa_perm, inverse)
-    rows = np.arange(15)
-    map_matrix = np.zeros((15,15), dtype=int)
-    map_matrix[rows, relationship] = 1
-
-    return map_matrix
-
-class QuartetSitePatternProbs:
-    """Calculates true site-pattern probabilities of quartet network under Multispecies Network Coalescent (MSNC)."""
-
-def getTrueProbsAsymm(myt1,myt2,myt3, theta, alpha):
-    # For an asymmetric quartet (A,(B,(C,D))), "label_speciation_time_idx" will label [1,2,3] in preorder traversal.
-    # /--------------------------------------------------------------------------- A
-    # + param_idx = 1
-    # |                        /-------------------------------------------------- B
-    # \------------------------+ param_idx = 2
-    # :                        |                        /------------------------- C
-    # :                        \------------------------+ param_idx = 3
-    # :                        :                        \------------------------- D
-    # tau3                     tau2                     tau1 (as in Chifman & Kubatko 2015)
-    #
-    # myt1 = Speciation time of taxa C,D
-    # myt2 = Speciation time of taxa B,C,D
-    # myt3 = Root age
-    # These get us the site pattern frequencies that match the data sets generated by the seq-gen
-    # pipeline that is commonly used in simulation studies.
-    # the order of the site patterns is as in the headings in Table 1 in the Supplement to Chifman and Kubatko (2015):
-    # xxxx - 0
-    # xxxy = xxyx - 1
-    # xyxx - 2
-    # yxxx - 3
-    # xxyy - 4
-    # xyxy = yxxy - 5
-    # xxyz - 6
-    # yzxx - 7
-    # xyxz = xyzx - 8
-    # yxxz = yxzx - 9
-    # xyzw - 10
-
-    # This is in mutation units, different from the original function of Chifman & Kubatko
-    t1 = myt1  # t1
-    t2 = myt2  # t2
-    t3 = myt3  # t3
-    t = 2 * theta  # 2*theta
-    m = alpha  # mu=4/3 for JC69
+        # This is in mutation units, different from the original function of Chifman & Kubatko
+        t1 = myt1  # t1
+        t2 = myt2  # t2
+        t3 = myt3  # t3
+        t = 2 * theta  # 2*theta
+        m = alpha  # mu=4/3 for JC69
 
 
 
-    #compute the C matrix
-    cmat = np.matrix(np.zeros((11, 10)))
+        #compute the C matrix
+        cmat = np.matrix(np.zeros((11, 10)))
 
-    # Row 0 (R's row 1)
-    cmat[0, 0] = 1 / 256
-    cmat[0, 1] = 3 / (256 * (1 + m * t))
-    cmat[0, 2] = 6 / (256 * (1 + m * t))
-    cmat[0, 3] = 12 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[0, 4] = 9 / (256 * (1 + m * t))
-    cmat[0, 5] = 12 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[0, 6] = 9 / (256 * (1 + m * t) ** 2)
-    cmat[0, 7] = 24 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[0, 8] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[0, 9] = (6 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 0 (R's row 1)
+        cmat[0, 0] = 1 / 256
+        cmat[0, 1] = 3 / (256 * (1 + m * t))
+        cmat[0, 2] = 6 / (256 * (1 + m * t))
+        cmat[0, 3] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[0, 4] = 9 / (256 * (1 + m * t))
+        cmat[0, 5] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[0, 6] = 9 / (256 * (1 + m * t) ** 2)
+        cmat[0, 7] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[0, 8] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[0, 9] = (6 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 1 (R's row 2)
-    cmat[1, 0] = 1 / 256
-    cmat[1, 1] = -1 / (256 * (1 + m * t))
-    cmat[1, 2] = 2 / (256 * (1 + m * t))
-    cmat[1, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[1, 4] = 5 / (256 * (1 + m * t))
-    cmat[1, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[1, 6] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[1, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[1, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[1, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 1 (R's row 2)
+        cmat[1, 0] = 1 / 256
+        cmat[1, 1] = -1 / (256 * (1 + m * t))
+        cmat[1, 2] = 2 / (256 * (1 + m * t))
+        cmat[1, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[1, 4] = 5 / (256 * (1 + m * t))
+        cmat[1, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[1, 6] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[1, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[1, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[1, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 2 (R's row 3)
-    cmat[2, 0] = 1 / 256
-    cmat[2, 1] = 3 / (256 * (1 + m * t))
-    cmat[2, 2] = -2 / (256 * (1 + m * t))
-    cmat[2, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[2, 4] = 5 / (256 * (1 + m * t))
-    cmat[2, 5] = 12 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[2, 6] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[2, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[2, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[2, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 2 (R's row 3)
+        cmat[2, 0] = 1 / 256
+        cmat[2, 1] = 3 / (256 * (1 + m * t))
+        cmat[2, 2] = -2 / (256 * (1 + m * t))
+        cmat[2, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[2, 4] = 5 / (256 * (1 + m * t))
+        cmat[2, 5] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[2, 6] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[2, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[2, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[2, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 3 (R's row 4)
-    cmat[3, 0] = 1 / 256
-    cmat[3, 1] = 3 / (256 * (1 + m * t))
-    cmat[3, 2] = 6 / (256 * (1 + m * t))
-    cmat[3, 3] = 12 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[3, 4] = -3 / (256 * (1 + m * t))
-    cmat[3, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[3, 6] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[3, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[3, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[3, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 3 (R's row 4)
+        cmat[3, 0] = 1 / 256
+        cmat[3, 1] = 3 / (256 * (1 + m * t))
+        cmat[3, 2] = 6 / (256 * (1 + m * t))
+        cmat[3, 3] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[3, 4] = -3 / (256 * (1 + m * t))
+        cmat[3, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[3, 6] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[3, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[3, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[3, 9] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 4 (R's row 5)
-    cmat[4, 0] = 1 / 256
-    cmat[4, 1] = 3 / (256 * (1 + m * t))
-    cmat[4, 2] = -2 / (256 * (1 + m * t))
-    cmat[4, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[4, 4] = 1 / (256 * (1 + m * t))
-    cmat[4, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[4, 6] = 9 / (256 * (1 + m * t) ** 2)
-    cmat[4, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[4, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[4, 9] = (2 * m * t * (4 + m * t) ** 2) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 4 (R's row 5)
+        cmat[4, 0] = 1 / 256
+        cmat[4, 1] = 3 / (256 * (1 + m * t))
+        cmat[4, 2] = -2 / (256 * (1 + m * t))
+        cmat[4, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[4, 4] = 1 / (256 * (1 + m * t))
+        cmat[4, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[4, 6] = 9 / (256 * (1 + m * t) ** 2)
+        cmat[4, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[4, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[4, 9] = (2 * m * t * (4 + m * t) ** 2) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 5 (R's row 6)
-    cmat[5, 0] = 1 / 256
-    cmat[5, 1] = -1 / (256 * (1 + m * t))
-    cmat[5, 2] = 2 / (256 * (1 + m * t))
-    cmat[5, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, 4] = 1 / (256 * (1 + m * t))
-    cmat[5, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, 6] = 1 / (256 * (1 + m * t) ** 2)
-    cmat[5, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[5, 9] = m * t * (2 * 16 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 5 (R's row 6)
+        cmat[5, 0] = 1 / 256
+        cmat[5, 1] = -1 / (256 * (1 + m * t))
+        cmat[5, 2] = 2 / (256 * (1 + m * t))
+        cmat[5, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, 4] = 1 / (256 * (1 + m * t))
+        cmat[5, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, 6] = 1 / (256 * (1 + m * t) ** 2)
+        cmat[5, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[5, 9] = m * t * (2 * 16 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 6 (R's row 7)
-    cmat[6, 0] = 1 / 256
-    cmat[6, 1] = -1 / (256 * (1 + m * t))
-    cmat[6, 2] = -2 / (256 * (1 + m * t))
-    cmat[6, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, 4] = 1 / (256 * (1 + m * t))
-    cmat[6, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, 6] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[6, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[6, 9] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 6 (R's row 7)
+        cmat[6, 0] = 1 / 256
+        cmat[6, 1] = -1 / (256 * (1 + m * t))
+        cmat[6, 2] = -2 / (256 * (1 + m * t))
+        cmat[6, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, 4] = 1 / (256 * (1 + m * t))
+        cmat[6, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, 6] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[6, 7] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[6, 9] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 7 (R's row 8)
-    cmat[7, 0] = 1 / 256
-    cmat[7, 1] = 3 / (256 * (1 + m * t))
-    cmat[7, 2] = -2 / (256 * (1 + m * t))
-    cmat[7, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[7, 4] = -3 / (256 * (1 + m * t))
-    cmat[7, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[7, 6] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[7, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[7, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[7, 9] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 7 (R's row 8)
+        cmat[7, 0] = 1 / 256
+        cmat[7, 1] = 3 / (256 * (1 + m * t))
+        cmat[7, 2] = -2 / (256 * (1 + m * t))
+        cmat[7, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[7, 4] = -3 / (256 * (1 + m * t))
+        cmat[7, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[7, 6] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[7, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[7, 8] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[7, 9] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 8 (R's row 9)
-    cmat[8, 0] = 1 / 256
-    cmat[8, 1] = -1 / (256 * (1 + m * t))
-    cmat[8, 2] = -2 / (256 * (1 + m * t))
-    cmat[8, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[8, 4] = 1 / (256 * (1 + m * t))
-    cmat[8, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[8, 6] = 1 / (256 * (1 + m * t) ** 2)
-    cmat[8, 7] = 0
-    cmat[8, 8] = 0
-    cmat[8, 9] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 8 (R's row 9)
+        cmat[8, 0] = 1 / 256
+        cmat[8, 1] = -1 / (256 * (1 + m * t))
+        cmat[8, 2] = -2 / (256 * (1 + m * t))
+        cmat[8, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[8, 4] = 1 / (256 * (1 + m * t))
+        cmat[8, 5] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[8, 6] = 1 / (256 * (1 + m * t) ** 2)
+        cmat[8, 7] = 0
+        cmat[8, 8] = 0
+        cmat[8, 9] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 9 (R's row 10)
-    cmat[9, 0] = 1 / 256
-    cmat[9, 1] = -1 / (256 * (1 + m * t))
-    cmat[9, 2] = 2 / (256 * (1 + m * t))
-    cmat[9, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[9, 4] = -3 / (256 * (1 + m * t))
-    cmat[9, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[9, 6] = 1 / (256 * (1 + m * t) ** 2)
-    cmat[9, 7] = 0
-    cmat[9, 8] = 0
-    cmat[9, 9] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 9 (R's row 10)
+        cmat[9, 0] = 1 / 256
+        cmat[9, 1] = -1 / (256 * (1 + m * t))
+        cmat[9, 2] = 2 / (256 * (1 + m * t))
+        cmat[9, 3] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[9, 4] = -3 / (256 * (1 + m * t))
+        cmat[9, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[9, 6] = 1 / (256 * (1 + m * t) ** 2)
+        cmat[9, 7] = 0
+        cmat[9, 8] = 0
+        cmat[9, 9] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Row 10 (R's row 11)
-    cmat[10, 0] = 1 / 256
-    cmat[10, 1] = -1 / (256 * (1 + m * t))
-    cmat[10, 2] = -2 / (256 * (1 + m * t))
-    cmat[10, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[10, 4] = -3 / (256 * (1 + m * t))
-    cmat[10, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[10, 6] = 1 / (256 * (1 + m * t) ** 2)
-    cmat[10, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[10, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[10, 9] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        # Row 10 (R's row 11)
+        cmat[10, 0] = 1 / 256
+        cmat[10, 1] = -1 / (256 * (1 + m * t))
+        cmat[10, 2] = -2 / (256 * (1 + m * t))
+        cmat[10, 3] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[10, 4] = -3 / (256 * (1 + m * t))
+        cmat[10, 5] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[10, 6] = 1 / (256 * (1 + m * t) ** 2)
+        cmat[10, 7] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[10, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[10, 9] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
 
-    # Get the beta vector
-    beta = np.matrix(np.zeros((10, 1)))
-    beta[0, 0] = 1
-    beta[1, 0] = np.exp(-2 * m * t1)
-    beta[2, 0] = np.exp(-2 * m * t2)
-    beta[3, 0] = np.exp(-m * t1) * np.exp(-2 * m * t2)
-    beta[4, 0] = np.exp(-2 * m * t3)
-    beta[5, 0] = np.exp(-m * t1) * np.exp(-2 * m * t3)
-    beta[6, 0] = np.exp(-2 * m * t1) * np.exp(-2 * m * t3)
-    beta[7, 0] = np.exp(-m * t2) * np.exp(-2 * m * t3)
-    beta[8, 0] = np.exp(-m * t1) * np.exp(-m * t2) * np.exp(-2 * m * t3)
-    # beta[9, 0] = np.exp((2 / t) * (t1 - t2)) * np.exp(-2 * m * (t2 + t3))
-    exp_9 = (2 / t) * (t1 - t2) - 2 * m * (t2 + t3)
-    beta[9, 0] = np.exp(np.clip(exp_9, a_min=-np.inf, a_max=700))
+        # Get the beta vector
+        beta = np.matrix(np.zeros((10, 1)))
+        beta[0, 0] = 1
+        beta[1, 0] = np.exp(-2 * m * t1)
+        beta[2, 0] = np.exp(-2 * m * t2)
+        beta[3, 0] = np.exp(-m * t1) * np.exp(-2 * m * t2)
+        beta[4, 0] = np.exp(-2 * m * t3)
+        beta[5, 0] = np.exp(-m * t1) * np.exp(-2 * m * t3)
+        beta[6, 0] = np.exp(-2 * m * t1) * np.exp(-2 * m * t3)
+        beta[7, 0] = np.exp(-m * t2) * np.exp(-2 * m * t3)
+        beta[8, 0] = np.exp(-m * t1) * np.exp(-m * t2) * np.exp(-2 * m * t3)
+        # beta[9, 0] = np.exp((2 / t) * (t1 - t2)) * np.exp(-2 * m * (t2 + t3))
+        exp_9 = (2 / t) * (t1 - t2) - 2 * m * (t2 + t3)
+        beta[9, 0] = np.exp(np.clip(exp_9, a_min=-np.inf, a_max=700))
 
-    # unweighted 11-category site pattern probability
-    p = cmat @ beta  # Here, @ means matrix multiplication
+        # unweighted 11-category site pattern probability
+        p = cmat @ beta  # Here, @ means matrix multiplication
 
-    # unweighted 15-category site pattern probability
-    p_15 = np.zeros(15)
-    p_15[0] = p[0,0]  # xxxx - 0
-    p_15[1:3] = p[1,0]  # xxxy - 1 & xxyx - 2
-    p_15[3] = p[2,0] # xyxx - 3
-    p_15[4] = p[3,0] # yxxx - 4
-    p_15[7] = p[4,0]  # xxyy - 7
-    p_15[5:7] = p[5,0]  # xyxy - 5 & yxxy - 6
-    p_15[12] = p[6,0]  # xxyz - 12
-    p_15[13] = p[7,0]  # yzxx - 13
-    p_15[8:10] = p[8,0]  # xyxz - 8 & xyzx - 9
-    p_15[10:12] = p[9,0]  # yxxz - 10 & yxzx - 11
-    p_15[14] = p[10,0]  # xyzw - 14
+        # unweighted 15-category site pattern probability
+        p_15 = np.zeros(15)
+        p_15[0] = p[0,0]  # xxxx - 0
+        p_15[1:3] = p[1,0]  # xxxy - 1 & xxyx - 2
+        p_15[3] = p[2,0] # xyxx - 3
+        p_15[4] = p[3,0] # yxxx - 4
+        p_15[7] = p[4,0]  # xxyy - 7
+        p_15[5:7] = p[5,0]  # xyxy - 5 & yxxy - 6
+        p_15[12] = p[6,0]  # xxyz - 12
+        p_15[13] = p[7,0]  # yzxx - 13
+        p_15[8:10] = p[8,0]  # xyxz - 8 & xyzx - 9
+        p_15[10:12] = p[9,0]  # yxxz - 10 & yxzx - 11
+        p_15[14] = p[10,0]  # xyzw - 14
 
-    weights = np.zeros(15, dtype=int)
-    weights[0] = 4  # 4 ways of xxxx-0: AAAA, CCCC, GGGG, TTTT
-    weights[1:5] = 12  # 4*3=12 ways of xxxy-1, xxyx-2, xyxx-3 & yxxx-4: AAAC, etc
-    weights[5:8] = 12  # 4*3=12 ways of xyxy-5, yxxy-6, xxyy-7: ACAC, etc
-    weights[8:14] = 24  # 4*3*2=24 ways of xyxz-8, xyzx-9, yxxz-10, yxzx-11, xxyz-12, yzxx-13
-    weights[14] = 24  # 4*3*2*1=24 ways of xyzw-14
+        weights = np.zeros(15, dtype=int)
+        weights[0] = 4  # 4 ways of xxxx-0: AAAA, CCCC, GGGG, TTTT
+        weights[1:5] = 12  # 4*3=12 ways of xxxy-1, xxyx-2, xyxx-3 & yxxx-4: AAAC, etc
+        weights[5:8] = 12  # 4*3=12 ways of xyxy-5, yxxy-6, xxyy-7: ACAC, etc
+        weights[8:14] = 24  # 4*3*2=24 ways of xyxz-8, xyzx-9, yxxz-10, yxzx-11, xxyz-12, yzxx-13
+        weights[14] = 24  # 4*3*2*1=24 ways of xyzw-14
 
-    return weights * p_15  # 11-category site pattern probabilities
+        return weights * p_15  # 11-category site pattern probabilities
 
+class SymmQuartet(QuartetTreeTopology):
+    """Symmetric Quartet Topology Strategy: ((A,B),(C,D))"""
 
-def getTrueProbsSymm(myt1,myt2,myt3, theta, alpha):
-    # For a symmetric quartet ((A,B),(C,D)), "label_speciation_time_idx" will label [1,2,3] in preorder traversal.
-    #                              /---------------------------------------------- A
-    # /----------------------------+ param_idx = 2
-    # |                            \---------------------------------------------- B
-    # + param_idx = 1              :
-    # |                            :                    /------------------------- C
-    # \-------------------------------------------------+ param_idx = 3
-    # :                            :                    \------------------------- D
-    # tau3                         tau2                 tau1 (as in Chifman & Kubatko 2015)
-    #
-    # myt1 = Speciation time of taxa C,D
-    # myt2 = Speciation time of taxa A,B
-    # myt3 = Root age
-    # These get us the site pattern frequencies that match the data sets generated by the seq-gen
-    # pipeline that is commonly used in simulation studies.
-    # the order of the site patterns is as in the headings in Table 1 in the Supplement to Chifman and Kubatko (2015):
-    # xxxx - 0
-    # xxxy = xxyx - 1
-    # xyxx = yxxx - 2
-    # xyxy = yxxy - 3
-    # xxyy - 4
-    # xxyz - 5
-    # yzxx - 6
-    # xyzx = yxxz = xyzx = yxzx - 7
-    # xyzw - 8
+    def get_true_probs(self, myt1: float, myt2: float, myt3: float, theta: float, alpha: float = 4 / 3):
+        # For a symmetric quartet ((A,B),(C,D)), "label_speciation_time_idx" will label [1,2,3] in preorder traversal.
+        #                              /---------------------------------------------- A
+        # /----------------------------+ param_idx = 2
+        # |                            \---------------------------------------------- B
+        # + param_idx = 1              :
+        # |                            :                    /------------------------- C
+        # \-------------------------------------------------+ param_idx = 3
+        # :                            :                    \------------------------- D
+        # tau3                         tau2                 tau1 (as in Chifman & Kubatko 2015)
+        #
+        # myt1 = Speciation time of taxa C,D
+        # myt2 = Speciation time of taxa A,B
+        # myt3 = Root age
+        # These get us the site pattern frequencies that match the data sets generated by the seq-gen
+        # pipeline that is commonly used in simulation studies.
+        # the order of the site patterns is as in the headings in Table 1 in the Supplement to Chifman and Kubatko (2015):
+        # xxxx - 0
+        # xxxy = xxyx - 1
+        # xyxx = yxxx - 2
+        # xyxy = yxxy - 3
+        # xxyy - 4
+        # xxyz - 5
+        # yzxx - 6
+        # xyzx = yxxz = xyzx = yxzx - 7
+        # xyzw - 8
 
-    # This is in mutation units, different from the original function of Chifman & Kubatko
-    t1 = myt1  # t1
-    t2 = myt2  # t2
-    t3 = myt3  # t3
-    t = 2 * theta  # 2*theta
-    m = alpha  # mu=4/3 for JC69
-
-
-
-    # compute the C matrix.
-    cmat = np.matrix(np.zeros((9,9)))
-
-    # Row 0 (R's row 1)
-    cmat[0, :] = [1 / 256 for i in range(9)]
-
-    # Row 1 (R's row 2)
-    cmat[1, [0, 2, 4, 6]] = 3 / (256 * (1 + m * t))
-    cmat[1, [1, 3, 5, 7, 8]] = -1 / (256 * (1 + m * t))
-
-    # Row 2 (R's row 3)
-    cmat[2, [0, 1, 4, 5]] = 3 / (256 * (1 + m * t))
-    cmat[2, [2, 3, 6, 7, 8]] = -1 / (256 * (1 + m * t))
-
-    # Row 3 (R's row 4)
-    cmat[3, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
-    cmat[3, [1, 2, 5, 6]] = -3 / (256 * (1 + m * t) ** 2)
-    cmat[3, [3, 7, 8]] = 1 / (256 * (1 + m * t) ** 2)
-
-    # Row 4 (R's row 5)
-    cmat[4, 0] = 12 / (256 * (1 + m * t))
-    cmat[4, [1, 2, 3]] = 4 / (256 * (1 + m * t))
-    cmat[4, [4, 5, 6, 8]] = -4 / (256 * (1 + m * t))
-    cmat[4, 7] = 0
-
-    # Row 5 (R's row 6)
-    cmat[5, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, [1, 3, 4, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, 2] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, [5, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[5, 7] = 0
-
-    # Row 6 (R's row 7)
-    cmat[6, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, [2, 3, 4, 5]] = -8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, [6, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
-    cmat[6, 7] = 0
-
-    # Row 7 (R's row 8)
-    cmat[7, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[7, [1, 2, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[7, [3, 5, 6]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-    cmat[7, 7] = 0
-    cmat[7, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-
-    # Row 8 (R's row 9)
-    cmat[8, 0] = 6 * m * t * (4 + m * t) * (4 + 3 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, [1, 2]] = -2 * m * t * (4 + m * t) * (4 + 3 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, 3] = m * t * (32 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, 4] = 2 * m * t * (4 + m * t) ** 2 / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, [5, 6]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, 7] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-    cmat[8, 8] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-
-    # get the beta vector
-    beta = np.matrix(np.zeros((9,1)))
-    beta[0, 0] = 1
-    beta[1, 0] = np.exp(-2 * m * t1)
-    beta[2, 0] = np.exp(-2 * m * t2)
-    beta[3, 0] = np.exp(-2 * m * t1) * np.exp(-2 * m * t2)
-    beta[4, 0] = np.exp(-2 * m * t3)
-    beta[5, 0] = np.exp(-m * t1) * np.exp(-2 * m * t3)
-    beta[6, 0] = np.exp(-m * t2) * np.exp(-2 * m * t3)
-    beta[7, 0] = np.exp(-m * t1) * np.exp(-m * t2) * np.exp(-2 * m * t3)
-    # beta[8, 0] = np.exp(2 * t1 / t) * np.exp(2 * t2 / t) * np.exp(-4 * t3 * (m + 1 / t))
-    exp_8 = (2 * t1 / t) + (2 * t2 / t) - 4 * t3 * (m + 1 / t)
-    beta[8, 0] = np.exp(np.clip(exp_8, a_min=-np.inf, a_max=700))
-
-    # unweighted 9-category site pattern probability
-    p = cmat.T @ beta # Here, @ means matrix multiplication
-
-    # unweighted 15-category site pattern probability
-    p_15 = np.zeros(15)
-    p_15[0] = p[0,0] # xxxx - 0
-    p_15[1:3] = p[1,0] # xxxy - 1 & xxyx - 2
-    p_15[3:5] = p[2,0] # xyxx - 3 & yxxx - 4
-    p_15[5:7] = p[3,0] # xyxy - 5 & yxxy - 6
-    p_15[7] = p[4,0] # xxyy - 7
-    p_15[12] = p[5,0] # xxyz - 12
-    p_15[13] = p[6,0] # yzxx - 13
-    p_15[8:12] = p[7,0] # xyxz - 8 & xyzx - 9 & yxxz - 10 & yxzx - 11
-    p_15[14] = p[8,0] # xyzw - 14
-
-    weights = np.zeros(15, dtype=int)
-    weights[0] = 4  # 4 ways of xxxx-0: AAAA, CCCC, GGGG, TTTT
-    weights[1:5] = 12  # 4*3=12 ways of xxxy-1, xxyx-2, xyxx-3 & yxxx-4: AAAC, etc
-    weights[5:8] = 12  # 4*3=12 ways of xyxy-5, yxxy-6, xxyy-7: ACAC, etc
-    weights[8:14] = 24  # 4*3*2=24 ways of xyxz-8, xyzx-9, yxxz-10, yxzx-11, xxyz-12, yzxx-13
-    weights[14] = 24  # 4*3*2*1=24 ways of xyzw-14
-
-    return weights * p_15  # weighted 15-category site pattern probabilities
+        # This is in mutation units, different from the original function of Chifman & Kubatko
+        t1 = myt1  # t1
+        t2 = myt2  # t2
+        t3 = myt3  # t3
+        t = 2 * theta  # 2*theta
+        m = alpha  # mu=4/3 for JC69
 
 
-def getTrueProbsQuartet(parameters, param_idx, is_asymm, taxa_perm, gamma_id):
-    """
-    Using the quartet features (param_idx, is_asymm, taxa_perm, gamma_id) of a combination of four taxa, get the true
-    site pattern probabilities for the quartet subnetwork pulled from network.
-    The site pattern probabilities of a quartet subnetwork is a weighted mixture of site pattern probabilities of
-    quartet subtrees pulled from the displayed trees.
-    """
 
-    # Extract parameters
-    h = gamma_id[0].size
-    tree_parameters = parameters[:-h]
-    gamma_parameters = parameters[-h:]
+        # compute the C matrix.
+        cmat = np.matrix(np.zeros((9,9)))
 
-    # Remove common gamma indices in gamma_id for the ease of computing gamma weight
-    gamma_id_clean = remove_common_elements(gamma_id)
+        # Row 0 (R's row 1)
+        cmat[0, :] = [1 / 256 for i in range(9)]
 
-    all_p_Qt = []
-    all_Gamma_t = []
+        # Row 1 (R's row 2)
+        cmat[1, [0, 2, 4, 6]] = 3 / (256 * (1 + m * t))
+        cmat[1, [1, 3, 5, 7, 8]] = -1 / (256 * (1 + m * t))
 
-    # For simplicity, we use these notation: pi = param_idx, ia = is_asymm, tp = taxa_perm, gi = gamma_id.
-    for pi, ia, tp, gi in zip(param_idx,is_asymm,taxa_perm,gamma_id_clean):
-        # 1. Get gamma weight
-        Gamma_t = get_gamma_weight(gamma_parameters, gi)
-        all_Gamma_t.append(Gamma_t)
+        # Row 2 (R's row 3)
+        cmat[2, [0, 1, 4, 5]] = 3 / (256 * (1 + m * t))
+        cmat[2, [2, 3, 6, 7, 8]] = -1 / (256 * (1 + m * t))
 
-        # 2. Get quartet parameters + site pattern mapping
-        tau1, tau2, tau3, theta = get_tau_theta(tree_parameters, pi)
-        SP_relation = get_sitePattern_relationship(tp)
+        # Row 3 (R's row 4)
+        cmat[3, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
+        cmat[3, [1, 2, 5, 6]] = -3 / (256 * (1 + m * t) ** 2)
+        cmat[3, [3, 7, 8]] = 1 / (256 * (1 + m * t) ** 2)
 
-        # 3. Compute site pattern probabilities (symmetric / asymmetric)
-        p_Qt = (getTrueProbsAsymm if ia else getTrueProbsSymm)(tau1, tau2, tau3, theta, 4 / 3)
-        all_p_Qt.append(p_Qt[SP_relation])  # Append site pattern probabilities with site pattern mapping applied
+        # Row 4 (R's row 5)
+        cmat[4, 0] = 12 / (256 * (1 + m * t))
+        cmat[4, [1, 2, 3]] = 4 / (256 * (1 + m * t))
+        cmat[4, [4, 5, 6, 8]] = -4 / (256 * (1 + m * t))
+        cmat[4, 7] = 0
 
-    # 4. Normalize gamma weights & compute TrueProbs
-    all_p_Qt = np.array(all_p_Qt)
-    if gamma_id.size > 1:   # quartet is a network
+        # Row 5 (R's row 6)
+        cmat[5, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, [1, 3, 4, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, 2] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, [5, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[5, 7] = 0
+
+        # Row 6 (R's row 7)
+        cmat[6, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, [2, 3, 4, 5]] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, [6, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        cmat[6, 7] = 0
+
+        # Row 7 (R's row 8)
+        cmat[7, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[7, [1, 2, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[7, [3, 5, 6]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        cmat[7, 7] = 0
+        cmat[7, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+
+        # Row 8 (R's row 9)
+        cmat[8, 0] = 6 * m * t * (4 + m * t) * (4 + 3 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, [1, 2]] = -2 * m * t * (4 + m * t) * (4 + 3 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, 3] = m * t * (32 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, 4] = 2 * m * t * (4 + m * t) ** 2 / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, [5, 6]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, 7] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        cmat[8, 8] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+
+        # get the beta vector
+        beta = np.matrix(np.zeros((9,1)))
+        beta[0, 0] = 1
+        beta[1, 0] = np.exp(-2 * m * t1)
+        beta[2, 0] = np.exp(-2 * m * t2)
+        beta[3, 0] = np.exp(-2 * m * t1) * np.exp(-2 * m * t2)
+        beta[4, 0] = np.exp(-2 * m * t3)
+        beta[5, 0] = np.exp(-m * t1) * np.exp(-2 * m * t3)
+        beta[6, 0] = np.exp(-m * t2) * np.exp(-2 * m * t3)
+        beta[7, 0] = np.exp(-m * t1) * np.exp(-m * t2) * np.exp(-2 * m * t3)
+        # beta[8, 0] = np.exp(2 * t1 / t) * np.exp(2 * t2 / t) * np.exp(-4 * t3 * (m + 1 / t))
+        exp_8 = (2 * t1 / t) + (2 * t2 / t) - 4 * t3 * (m + 1 / t)
+        beta[8, 0] = np.exp(np.clip(exp_8, a_min=-np.inf, a_max=700))
+
+        # unweighted 9-category site pattern probability
+        p = cmat.T @ beta # Here, @ means matrix multiplication
+
+        # unweighted 15-category site pattern probability
+        p_15 = np.zeros(15)
+        p_15[0] = p[0,0] # xxxx - 0
+        p_15[1:3] = p[1,0] # xxxy - 1 & xxyx - 2
+        p_15[3:5] = p[2,0] # xyxx - 3 & yxxx - 4
+        p_15[5:7] = p[3,0] # xyxy - 5 & yxxy - 6
+        p_15[7] = p[4,0] # xxyy - 7
+        p_15[12] = p[5,0] # xxyz - 12
+        p_15[13] = p[6,0] # yzxx - 13
+        p_15[8:12] = p[7,0] # xyxz - 8 & xyzx - 9 & yxxz - 10 & yxzx - 11
+        p_15[14] = p[8,0] # xyzw - 14
+
+        weights = np.zeros(15, dtype=int)
+        weights[0] = 4  # 4 ways of xxxx-0: AAAA, CCCC, GGGG, TTTT
+        weights[1:5] = 12  # 4*3=12 ways of xxxy-1, xxyx-2, xyxx-3 & yxxx-4: AAAC, etc
+        weights[5:8] = 12  # 4*3=12 ways of xyxy-5, yxxy-6, xxyy-7: ACAC, etc
+        weights[8:14] = 24  # 4*3*2=24 ways of xyxz-8, xyzx-9, yxxz-10, yxzx-11, xxyz-12, yzxx-13
+        weights[14] = 24  # 4*3*2*1=24 ways of xyzw-14
+
+        return weights * p_15  # weighted 15-category site pattern probabilities
+
+
+##############################################################################################################
+## A quartet subnetwork may have multiple displayed quartet subtrees, which are saved as QuartetTreeFeature ##
+## (param_idx, topology, taxa_perm, gamma_id). This section handles classes regarding quartet features.     ##
+##############################################################################################################
+
+@dataclass
+class QuartetTreeFeature:
+    """Encapsulates quartet features (param_idx, topology, taxa_perm, gamma_id) for a single displayed quartet subtree."""
+    param_idx: list[int]
+    topology: QuartetTreeTopology  # Instance of AsymmQuartet or SymmQuartet
+    taxa_perm: list[int]
+    gamma_id: list[int]
+
+
+@dataclass
+class QuartetFeature:
+    """Encapsulates quartet features (param_idx, is_asymm, taxa_perm, gamma_id) for a 4-taxa subnetwork."""
+    taxa: tuple
+    tree_features: list["QuartetTreeFeature"]
+
+    @property
+    def param_idx(self):
+        """Delegates param_idx directly to the underlying QuartetTreeFeature."""
+        return np.array([tf.param_idx for tf in self.tree_features])
+
+    @property
+    def is_asymm(self):
+        """Delegates is_asymm directly to the underlying QuartetTreeFeature."""
+        return np.array([isinstance(tf.topology, AsymmQuartet) for tf in self.tree_features])
+
+    @property
+    def taxa_perm(self):
+        """Delegates taxa_perm directly to the underlying QuartetTreeFeature."""
+        return np.array([tf.taxa_perm for tf in self.tree_features])
+
+    @property
+    def gamma_id(self):
+        """Delegates gamma_id directly to the underlying QuartetTreeFeature."""
+        return np.array([tf.gamma_id for tf in self.tree_features])
+
+    def to_dict(self):
+        """Helper to convert to a dictionary if matrix format is needed for downstream models."""
+        return {
+            "taxa": self.taxa,
+            "param_idx": self.param_idx,
+            "is_asymm": self.is_asymm,
+            "taxa_perm": self.taxa_perm,
+            "gamma_id": self.gamma_id
+        }
+
+    @property
+    def num_retic(self):
+        """Total number of gamma parameters."""
+        return self.gamma_id.size
+
+    @staticmethod
+    def identify_site_pattern_index(site_pattern):
+        """Given an input site pattern with length four, identify the corresponding index."""
+
+        from collections import Counter
+
+        # site_pattern = np.array(['A', 'A', 'A', 'C']) # Example site for testing
+        repeated_nucleo_count = len(np.unique(site_pattern))
+        if repeated_nucleo_count == 1:
+            # xxxx - 0
+            site_pattern_idx = 0
+        elif repeated_nucleo_count == 2:
+            # store the unique nucleotides with corresponding counts in a site
+            unique_nucleo = Counter(site_pattern)
+            if max(unique_nucleo.values()) == 3:
+                least_freq_nucleo = min(unique_nucleo, key=unique_nucleo.get)
+                locations = np.where(site_pattern == least_freq_nucleo)[0][0]  # location of least frequent nucleotide
+                # xxxy - 1. Least frequent nucleotide location is 3
+                # xxyx - 2. Least frequent nucleotide location is 2
+                # xyxx - 3. Least frequent nucleotide location is 1
+                # yxxx - 4. Least frequent nucleotide location is 0
+                site_pattern_idx = int(4 - locations)
+            else:  # elif max(unique_nucleo.values()) == 2:
+                locations = np.where(site_pattern == site_pattern[0])[0][1]
+                if locations == 2:
+                    # xyxy - 5. Second appearance of the first nucleotide (x) is location 2
+                    site_pattern_idx = 5
+                elif locations == 3:
+                    # yxxy - 6. Second appearance of the first nucleotide (y) is location 3
+                    site_pattern_idx = 6
+                else:  # elif locations == 1:
+                    # xxyy - 7. Second appearance of the first nucleotide (x) is location 1
+                    site_pattern_idx = 7
+        elif repeated_nucleo_count == 3:
+            unique_nucleo = Counter(site_pattern)
+            most_freq_nucleo = max(unique_nucleo, key=unique_nucleo.get)
+            locations = np.where(site_pattern == most_freq_nucleo)[0]
+            if np.all(locations == [0, 2]):
+                # xyxz - 8. Most frequent nucleotide location is [0,2]
+                site_pattern_idx = 8
+            elif np.all(locations == [0, 3]):
+                # xyzx - 9. Most frequent nucleotide location is [0,3]
+                site_pattern_idx = 9
+            elif np.all(locations == [1, 2]):
+                # yxxz - 10. Most frequent nucleotide location is [1,2]
+                site_pattern_idx = 10
+            elif np.all(locations == [1, 3]):
+                # yxzx - 11. Most frequent nucleotide location is [1,3]
+                site_pattern_idx = 11
+            elif np.all(locations == [0, 1]):
+                # xxyz - 12. Most frequent nucleotide location is [0,1]
+                site_pattern_idx = 12
+            else:  # elif np.all(locations == [2,3]):
+                # yzxx - 13. Most frequent nucleotide location is [2,3]
+                site_pattern_idx = 13
+        else:  # elif repeated_nucleo_count == 4:
+            # xyzw - 14
+            site_pattern_idx = 14
+
+        return site_pattern_idx
+
+    @staticmethod
+    def get_site_pattern_relationship(taxa_perm, inverse: bool = False):
+        """
+        Get the site pattern relationship vector (a list that permutes the indexing of the 15 category site pattern)
+        given the taxa permutation from the quartet feature.
+        """
+        # # Below are codes for generating the dict_relationship mapping.
+        # import numpy as np
+        # import itertools
+        # index_to_pattern = np.array([
+        #     ["x", "x", "x", "x"],  # 0
+        #     ["x", "x", "x", "y"],  # 1
+        #     ["x", "x", "y", "x"],  # 2
+        #     ["x", "y", "x", "x"],  # 3
+        #     ["y", "x", "x", "x"],  # 4
+        #     ["x", "y", "x", "y"],  # 5
+        #     ["y", "x", "x", "y"],  # 6
+        #     ["x", "x", "y", "y"],  # 7
+        #     ["x", "y", "x", "z"],  # 8
+        #     ["x", "y", "z", "x"],  # 9
+        #     ["y", "x", "x", "z"],  # 10
+        #     ["y", "x", "z", "x"],  # 11
+        #     ["x", "x", "y", "z"],  # 12
+        #     ["y", "z", "x", "x"],  # 13
+        #     ["x", "y", "z", "w"]   # 14
+        # ])
+        # dict_relationship = {
+        # perm: [QuartetFeature.identify_site_pattern_index(sp)
+        #        for sp in index_to_pattern[:, perm]]
+        # for perm in itertools.permutations([0, 1, 2, 3])
+        # }
+
+        # For each taxa permutation, get the site pattern relationship from dict_relationship
+        dict_relationship = {
+            (0, 1, 2, 3): [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            (0, 1, 3, 2): [0, 2, 1, 3, 4, 6, 5, 7, 9, 8, 11, 10, 12, 13, 14],
+            (0, 2, 1, 3): [0, 1, 3, 2, 4, 7, 6, 5, 12, 9, 10, 13, 8, 11, 14],
+            (0, 2, 3, 1): [0, 2, 3, 1, 4, 7, 5, 6, 12, 8, 11, 13, 9, 10, 14],
+            (0, 3, 1, 2): [0, 3, 1, 2, 4, 6, 7, 5, 9, 12, 13, 10, 8, 11, 14],
+            (0, 3, 2, 1): [0, 3, 2, 1, 4, 5, 7, 6, 8, 12, 13, 11, 9, 10, 14],
+            (1, 0, 2, 3): [0, 1, 2, 4, 3, 6, 5, 7, 10, 11, 8, 9, 12, 13, 14],
+            (1, 0, 3, 2): [0, 2, 1, 4, 3, 5, 6, 7, 11, 10, 9, 8, 12, 13, 14],
+            (1, 2, 0, 3): [0, 1, 3, 4, 2, 6, 7, 5, 10, 13, 12, 9, 8, 11, 14],
+            (1, 2, 3, 0): [0, 2, 3, 4, 1, 5, 7, 6, 11, 13, 12, 8, 9, 10, 14],
+            (1, 3, 0, 2): [0, 3, 1, 4, 2, 7, 6, 5, 13, 10, 9, 12, 8, 11, 14],
+            (1, 3, 2, 0): [0, 3, 2, 4, 1, 7, 5, 6, 13, 11, 8, 12, 9, 10, 14],
+            (2, 0, 1, 3): [0, 1, 4, 2, 3, 7, 5, 6, 12, 11, 8, 13, 10, 9, 14],
+            (2, 0, 3, 1): [0, 2, 4, 1, 3, 7, 6, 5, 12, 10, 9, 13, 11, 8, 14],
+            (2, 1, 0, 3): [0, 1, 4, 3, 2, 5, 7, 6, 8, 13, 12, 11, 10, 9, 14],
+            (2, 1, 3, 0): [0, 2, 4, 3, 1, 6, 7, 5, 9, 13, 12, 10, 11, 8, 14],
+            (2, 3, 0, 1): [0, 3, 4, 1, 2, 5, 6, 7, 8, 10, 9, 11, 13, 12, 14],
+            (2, 3, 1, 0): [0, 3, 4, 2, 1, 6, 5, 7, 9, 11, 8, 10, 13, 12, 14],
+            (3, 0, 1, 2): [0, 4, 1, 2, 3, 5, 7, 6, 11, 12, 13, 8, 10, 9, 14],
+            (3, 0, 2, 1): [0, 4, 2, 1, 3, 6, 7, 5, 10, 12, 13, 9, 11, 8, 14],
+            (3, 1, 0, 2): [0, 4, 1, 3, 2, 7, 5, 6, 13, 8, 11, 12, 10, 9, 14],
+            (3, 1, 2, 0): [0, 4, 2, 3, 1, 7, 6, 5, 13, 9, 10, 12, 11, 8, 14],
+            (3, 2, 0, 1): [0, 4, 3, 1, 2, 6, 5, 7, 10, 8, 11, 9, 13, 12, 14],
+            (3, 2, 1, 0): [0, 4, 3, 2, 1, 5, 6, 7, 11, 9, 10, 8, 13, 12, 14]}
+
+        if inverse:
+            return dict_relationship[tuple(np.argsort(taxa_perm))]
+        else:
+            return dict_relationship[tuple(taxa_perm)]
+
+    @staticmethod
+    def get_site_pattern_map_matrix(taxa_perm, inverse: bool = False):
+        """
+        Get the site pattern mapping matrix (a linear transformation matrix that permutes the 15 categories site pattern
+        by matrix multiplication) given the taxa permutation from the quartet feature.
+        """
+
+        relationship = QuartetFeature.get_site_pattern_relationship(taxa_perm, inverse)
+        rows = np.arange(15)
+        map_matrix = np.zeros((15, 15), dtype=int)
+        map_matrix[rows, relationship] = 1
+
+        return map_matrix
+
+    def get_true_probs(self, net_params: NetworkParameters, alpha: float = 4 / 3):
+        """
+        Using the quartet features (param_idx, is_asymm, taxa_perm, gamma_id) of a combination of four taxa, get the true
+        site pattern probabilities for the quartet subnetwork pulled from network.
+        The site pattern probabilities of a quartet subnetwork is a weighted mixture of site pattern probabilities of
+        quartet subtrees pulled from the displayed trees.
+        """
+        # Remove common gamma indices in gamma_id for the ease of computing gamma weight
+        gamma_id_clean = net_params.gamma.remove_common_elements(self.gamma_id)
+
+        all_p_Qt = []
+        all_Gamma_t = []
+
+        # For simplicity, we use these notation: qt_feat = quartet tree feature, gi_c = cleaned gamma_id.
+        for qt_feat, gi_c in zip(self.tree_features, gamma_id_clean):
+            # 1. Get gamma weight
+            all_Gamma_t.append(net_params.gamma.get_gamma_weight(gi_c))
+
+            # 2. Get quartet parameters + site pattern mapping
+            tau1, tau2, tau3, theta = net_params.tree.get_tau_theta(qt_feat.param_idx)
+            sp_relation = QuartetFeature.get_site_pattern_relationship(qt_feat.taxa_perm)
+
+            # 3. Compute site pattern probabilities (symmetric / asymmetric)
+            p_Qt = qt_feat.topology.get_true_probs(tau1, tau2, tau3, theta, 4 / 3)
+            all_p_Qt.append(p_Qt[sp_relation])  # Append site pattern probabilities with site pattern mapping applied
+
+        # 4. Normalize gamma weights & compute TrueProbs
+        all_p_Qt = np.array(all_p_Qt)
         all_Gamma_t = np.array(all_Gamma_t)
-        if np.isclose(all_Gamma_t.sum(), 0.0):
-            raise ValueError("The denominator all_Gamma_t.sum() is zero when normalizing gamma weights.")
+        if self.num_retic > 1:  # quartet is a network
+            if np.isclose(all_Gamma_t.sum(), 0.0):
+                raise ValueError("The denominator all_Gamma_t.sum() is zero when normalizing gamma weights.")
+            all_Gamma_t = all_Gamma_t / all_Gamma_t.sum()
+            TrueProbs = all_p_Qt.T @ all_Gamma_t
+        else:  # quartet is a tree
+            TrueProbs = all_p_Qt[0]
 
-        all_Gamma_t = all_Gamma_t/all_Gamma_t.sum()
-        TrueProbs = all_p_Qt.T @ all_Gamma_t
-    else:                   # quartet is a tree
-        TrueProbs = all_p_Qt[0]
+        return TrueProbs
 
-    return TrueProbs
+
+@dataclass
+class PairedQuartetFeature:
+    """Encapsulates paired seq_data_rows with quartet features (param_idx, is_asymm, taxa_perm, gamma_id)"""
+    seq_data_rows: np.ndarray
+    quartet_feature: QuartetFeature
+
+    def __getattr__(self, name: str):
+        """
+        If an attribute or method isn't found on PairedQuartetFeature, Python automatically redirects the call to
+        self.quartet_feature.
+        """
+        return getattr(self.quartet_feature, name)
+
 
 
 ######################################################
@@ -1475,7 +1487,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
     # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as key.
     # Task 3: Assign weighted unique_site_count to the site pattern by key (site pattern identification code) and
     #         collapse site pattern counts with the same key.
-    def sitePattern_IDcode(sitePattern):
+    def site_pattern_IDcode(site_pattern):
         """
         Convert a site pattern (in nucleotides) into ID code composed of x,y,z,w.
         When multiple nucleotides have the same frequency in a site pattern, the first nucleotide encountered
@@ -1487,16 +1499,16 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
         from collections import Counter
 
         # Count nucleotide frequencies. We use 'x' to denote the most frequent nucleotide and so on for 'y','z','w'.
-        counts = Counter(sitePattern)
+        counts = Counter(site_pattern)
 
         # When nucleotide frequencies tied in a site pattern, the first appeared nucleotide wins. (not by alphabetical order)
         # Example: ['A', 'A', 'A', 'G', 'G', 'C', 'C', 'T'] => 'xxxyyzzw' by first appearance order
         #          ['A', 'A', 'A', 'G', 'G', 'C', 'C', 'T'] => 'xxxzzyyw' by alphabetical order
 
         # Store index of first appearance of A,C,G,T
-        # first_occurrence = {nuc: i for i, nuc in enumerate(sitePattern)} # index of the last occurrence of A,C,G,T
+        # first_occurrence = {nuc: i for i, nuc in enumerate(site_pattern)} # index of the last occurrence of A,C,G,T
         first_occurrence = {}
-        for i, nuc in enumerate(sitePattern):
+        for i, nuc in enumerate(site_pattern):
             if nuc not in first_occurrence:
                 first_occurrence[nuc] = i
 
@@ -1508,7 +1520,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
         mapping = {nuc: mapping_letters[i] for i, nuc in enumerate(sorted_nucleotides)}
 
         # Convert site pattern to identification code
-        code = [mapping[nuc] for nuc in sitePattern]
+        code = [mapping[nuc] for nuc in site_pattern]
 
         return code
 
@@ -1549,7 +1561,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
 
         # Calculate the weight of each pattern using the fast lookup dictionary
         SitePattern_weights = np.prod(
-            [[weight_map[nuc] for nuc in sitePattern] for sitePattern in expanded_SitePatterns],
+            [[weight_map[nuc] for nuc in site_pattern] for site_pattern in expanded_SitePatterns],
             axis=1
         )
         SitePattern_weight_proportions = SitePattern_weights / SitePattern_weights.sum()
@@ -1581,7 +1593,7 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
         # Task 1: Expand each unique site (w/ ambiguity code) into list of possible sites (w/o ambiguity) with weight proportions.
         for site, weight in expand_weighted_SitePattern(unique_site, ACGT_weight):
             # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as dict_key.
-            key_IDcode = tuple(sitePattern_IDcode(site))
+            key_IDcode = tuple(site_pattern_IDcode(site))
 
             # Task 3: Accumulate weighted counts to the same site pattern ID
             dict_n_D[key_IDcode] += weight * count
@@ -2140,7 +2152,7 @@ def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, 
         for p_hat_Q, param_idx, is_asymm, taxa_perm in precomputed_data:
             for pi, ia, tp in zip(param_idx, is_asymm, taxa_perm):
                 tau_idx = (J - pi)[:3]  # convert to 0-based indexing
-                SP_relation = get_sitePattern_relationship(np.argsort(tp))
+                SP_relation = get_site_pattern_relationship(np.argsort(tp))
                 tau_vals = (get_MOM_tau_asymm if ia else get_MOM_tau_symm)(p_hat_Q[SP_relation], theta)
 
                 # Accumulate the reversed values
@@ -2435,7 +2447,7 @@ def get_Grad_Hess_Quartet(parameters, n_Q, param_idx, is_asymm, taxa_perm, gamma
         # get gamma weight for Q_t (Γ_t)
         Gamma_t = get_gamma_weight(gamma_parameters, gi)
         # Get 15 category permutation matrix (Ω_t)
-        Omega = get_sitePattern_map_matrix(tp)
+        Omega = get_site_pattern_map_matrix(tp)
 
         # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric and
         # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
@@ -2771,7 +2783,7 @@ def get_Grad_Hess_Quartet(parameters, n_Q, param_idx, is_asymm, taxa_perm, gamma
         # get gamma weight for Q_t (Gamma_t)
         Gamma_t = get_gamma_weight(gamma_parameters, gi)
         # Get 15 category permutation matrix (Ω_t)
-        Omega = get_sitePattern_map_matrix(tp)
+        Omega = get_site_pattern_map_matrix(tp)
 
         # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric and
         # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
