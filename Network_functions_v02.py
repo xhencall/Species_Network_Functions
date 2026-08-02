@@ -25,10 +25,22 @@ class SpeciesNetwork:
     """Class of species network for manipulating PhyloX networks."""
     def __init__(self, phylox_network: "phylox.dinetwork.DiNetwork", is_labeled: bool = False) -> None:
         self.phylox_network = phylox_network
-        self.num_taxa = len(self.leaves)  # number of taxa
-        self.num_retic = len(self.reticulations)  # number of hybrids
-        self.num_tau = self.num_taxa + self.num_retic - 1  # total number of tau parameters
         self.is_labeled = is_labeled
+
+    @property
+    def num_taxa(self):
+        """number of taxa"""
+        return len(self.leaves)
+
+    @property
+    def num_retic(self):
+        """number of reticulations"""
+        return len(self.reticulations)
+
+    @property
+    def num_tau(self):
+        """total number of tau parameters"""
+        return self.num_taxa + self.num_retic - 1
 
     def __getattr__(self, name: str):
         """
@@ -198,10 +210,10 @@ class SpeciesNetwork:
         root = list(self.roots)[0]
         if self.out_degree(root) == 1:
             # If root is unary, speciation_nodes = [all degree-3 nodes]
-            speciation_nodes = [node for node in self.nodes if self.degree[node] == 3]
+            speciation_nodes = [node for node in self.nodes if self.degree(node) == 3]
         else:
             # If root is binary, speciation_nodes = root + [all degree-3 nodes]
-            speciation_nodes = [root] + [node for node in self.nodes if self.degree[node] == 3]
+            speciation_nodes = [root] + [node for node in self.nodes if self.degree(node) == 3]
 
         # Get the speciation time index labeled on speciation_nodes by pre-order traversal
         try:
@@ -248,7 +260,7 @@ class SpeciesNetwork:
         need_remove = self.get_need_remove_nodes(leaf_node)
         self.remove_nodes_from(need_remove)
 
-    def get_quartet_with_taxa_labels(self, taxa_labels: list[str]):
+    def get_quartet_with_taxa_labels(self, taxa_labels: list[str]) -> "SpeciesNetwork":
         """
         Using PhyloX features to find a subtree containing only taxa_labels.
         """
@@ -363,13 +375,43 @@ class SpeciesNetwork:
         # Return the taxa permutation of input asymmetric_quart
         return [unsorted_taxa_order.index(x) for x in sorted_taxa_order]
 
+    def print_tree(self):
+        """
+        Using DendroPy graphing tool, print a PhyloX self in ASCII format and Newick format.
+        """
+        clone_tree = self.copy()
+        clone_tree.erase_all_node_labels()
+        dendropy_tree = dendropy.Tree.get(data=clone_tree.newick(), schema="newick", rooting="default-rooted")
+        print(dendropy_tree.as_string(schema="newick"))
+        print(dendropy_tree.as_ascii_plot())
 
-    ##----- Working with displayed trees and gamma's -----##
-    @staticmethod
-    def get_retic_number(node: int):
-        """Helper function to extract the integer from labels like '#H1'. """
-        match = re.search(r'\d+', str(node))
-        return int(match.group()) if match else 0
+    def newick(self):
+        """
+        Get a simple Newick string from a labeled network, ignoring all internal node labels.
+        Usually, we can use command self.newick() to print Newick format. This function exists because
+        labeled_network.newick() will report error.
+        """
+
+        # --- Step 1: Identify the root (taking care of unary root)
+        root = list(self.roots)[0]
+        if self.out_degree(root) == 1:
+            root = next(self.successors(root))
+
+        # --- Step 2: Recursive function
+        def node_to_newick(node):
+            # Leaf: return its taxon label
+            if node in self.leaves:
+                return str(self.nodes[node]["label"])
+
+            # Internal node: process children
+            children = list(self.successors(node))
+            children_strings = [node_to_newick(c) for c in children]
+
+            # No internal labels included → return "(child1,child2)"
+            return "(" + ",".join(children_strings) + ")"
+
+        # --- Step 3: Build final Newick
+        return node_to_newick(root) + ";"
 
     def get_displayed_trees(self):
         """
@@ -415,7 +457,21 @@ class SpeciesNetwork:
 
         return all_disp_trees
 
-    def get_displayed_tree_gamma_id(self, major_tree: "SpeciesNetwork"):
+
+class DisplayedTreeExtractor:
+    """Extracts displayed trees and gamma identifiers from a SpeciesNetwork."""
+
+    def __init__(self, network: SpeciesNetwork, major_tree: "SpeciesNetwork"):
+        self.network = network
+        self.major_tree = major_tree
+
+    @staticmethod
+    def get_retic_number(node: int):
+        """Helper function to extract the integer from labels like '#H1'. """
+        match = re.search(r'\d+', str(node))
+        return int(match.group()) if match else 0
+
+    def get_displayed_tree_gamma_id(self):
         """
         Given a phylogenetic network from PhyloX: self, returns a list of (displayed_tree, gamma_id) pairs.
         The displayed_tree is a DiNetwork with one parental choice at each hybrid, and
@@ -426,11 +482,11 @@ class SpeciesNetwork:
         gamma_id=[1,-2] -> weight=gamma_1*(1-gamma_2)
         """
         # label nodes on network with speciation time index
-        labeled_network = self.copy()
+        labeled_network = self.network.copy()
         labeled_network.label_speciation_time_idx()
 
         # Grab the reticulations and explicitly SORT them by their numerical label
-        reticulations = sorted(list(self.reticulations), key=self.get_retic_number)
+        reticulations = sorted(list(self.network.reticulations), key=self.get_retic_number)
         h = len(reticulations)
 
         # No reticulations → return network with weight 1
@@ -458,9 +514,9 @@ class SpeciesNetwork:
                 leaf_labels_disp = disp_tree.get_leaf_labels_below_node(parent_node_disp)
 
                 retic_label = labeled_network.get_label_from_node(retic_node)
-                retic_node_majr = major_tree.get_node_from_label(retic_label)
-                parent_node_majr = next(major_tree.predecessors(retic_node_majr))
-                leaf_labels_majr = major_tree.get_leaf_labels_below_node(parent_node_majr)
+                retic_node_majr = self.major_tree.get_node_from_label(retic_label)
+                parent_node_majr = next(self.major_tree.predecessors(retic_node_majr))
+                leaf_labels_majr = self.major_tree.get_leaf_labels_below_node(parent_node_majr)
 
                 if leaf_labels_disp == leaf_labels_majr:
                     gamma_id.append(-(i+1)) # adjust for 1-based indexing in gamma_id
@@ -471,7 +527,7 @@ class SpeciesNetwork:
 
         return all_disp_tree_gamma_id
 
-    def get_newick_displayed_tree_gamma_id(self, major_tree: "SpeciesNetwork"):
+    def get_newick_displayed_tree_gamma_id(self):
         """
         Given a phylogenetic network from PhyloX, returns a list of (Newick_string, gamma_id) pairs.
         All degree-2 nodes are suppressed and internal labels erased before generating the Newick string.
@@ -480,7 +536,7 @@ class SpeciesNetwork:
         gamma_id=-1 -> weight=1-gamma_1.
         gamma_id=[1,-2] -> weight=gamma_1*(1-gamma_2)
         """
-        all_weighted_trees = self.get_displayed_tree_gamma_id(major_tree)
+        all_weighted_trees = self.get_displayed_tree_gamma_id()
         all_newick_disp_tree_gamma_id = []
 
         for disp_tree, gamma_id in all_weighted_trees:
@@ -497,46 +553,18 @@ class SpeciesNetwork:
 
         return all_newick_disp_tree_gamma_id
 
-    def newick(self):
-        """
-        Get a simple Newick string from a labeled network, ignoring all internal node labels.
-        Usually, we can use command self.newick() to print Newick format. This function exists because
-        labeled_network.newick() will report error.
-        """
 
-        # --- Step 1: Identify the root (taking care of unary root)
-        root = list(self.roots)[0]
-        if self.out_degree(root) == 1:
-            root = next(self.successors(root))
+class QuartetFeatureExtractor:
+    """Extracts quartet features (param_idx, topology, taxa_perm, gamma_id) across all 4-taxa combinations."""
 
-        # --- Step 2: Recursive function
-        def node_to_newick(node):
-            # Leaf: return its taxon label
-            if node in self.leaves:
-                return str(self.nodes[node]["label"])
-
-            # Internal node: process children
-            children = list(self.successors(node))
-            children_strings = [node_to_newick(c) for c in children]
-
-            # No internal labels included → return "(child1,child2)"
-            return "(" + ",".join(children_strings) + ")"
-
-        # --- Step 3: Build final Newick
-        return node_to_newick(root) + ";"
-
-    def print_tree(self):
-        """
-        Using DendroPy graphing tool, print a PhyloX self in ASCII format and Newick format.
-        """
-        clone_tree = self.copy()
-        clone_tree.erase_all_node_labels()
-        dendropy_tree = dendropy.Tree.get(data=clone_tree.newick(), schema="newick", rooting="default-rooted")
-        print(dendropy_tree.as_string(schema="newick"))
-        print(dendropy_tree.as_ascii_plot())
+    def __init__(self, network: SpeciesNetwork, major_tree: "SpeciesNetwork"):
+        self.network = network
+        self.major_tree = major_tree
+        # Composition: Instantiate extractor helper during initialization
+        self.tree_extractor = DisplayedTreeExtractor(self.network, self.major_tree)
 
     ##----- Working with quartet features of quartet subnetworks -----##
-    def get_all_quartet_features(self, major_tree: "SpeciesNetwork"):
+    def get_all_quartet_features(self):
         """
         For each combination of 4 taxa, get the quartet features (parameter indices: param_idx, quartet types: is_asymm,
         taxa permutations: taxa_perm, and gamma id's: gamma_id) of the sub-quartets pulled from each displayed tree. If
@@ -547,11 +575,11 @@ class SpeciesNetwork:
         We use PhyloX to label speciation time indices in preorder traversal.
         """
         # Get all possible combinations of four taxa labels
-        taxa_labels = self.get_taxa_labels()
+        taxa_labels = self.network.get_taxa_labels()
         four_taxa_combs = combinations(taxa_labels, 4)
 
         # Get all displayed trees with gamma_id's used to compute weight
-        all_disp_tree_gamma_id = self.get_displayed_tree_gamma_id(major_tree)
+        all_disp_tree_gamma_id = self.tree_extractor.get_displayed_tree_gamma_id()
 
         # Create empty lists
         quartet_features_list = []
@@ -597,11 +625,27 @@ class SpeciesNetwork:
 
         return quartet_features_list
 
-    def get_taxa_partition(self, seq_data: "dendropy.DnaCharacterMatrix", Imap_file_path: str):
+
+class QuartetFeaturePairer:
+    """Pairs DNA sequence data rows with corresponding quartet features."""
+
+    def __init__(self,
+                 network: SpeciesNetwork,
+                 major_tree: "SpeciesNetwork",
+                 seq_data: "dendropy.DnaCharacterMatrix",
+                 imap_path: str | None = None):
+        self.network = network
+        self.major_tree = major_tree
+        self.seq_data = seq_data
+        self.imap_path = imap_path
+        # Composition: Instantiate extractor helper during initialization
+        self.feature_extractor = QuartetFeatureExtractor(self.network, self.major_tree)
+
+    def get_taxa_partition(self):
         """Produce tax_partition from user input Imap file"""
         # Read the Imap file into a dictionary
         imap_dict = {}
-        with open(Imap_file_path, "r") as f:
+        with open(self.imap_path, "r") as f:
             for line in f:
                 old_name, species = line.strip().split()
                 imap_dict.setdefault(species,[]).append(old_name)
@@ -619,15 +663,13 @@ class SpeciesNetwork:
 
         taxa_partition = [
             # seq_data row indices of the taxa that contains the species name in the self
-            [idx for idx, seq_taxon in enumerate(seq_data.taxon_namespace) if matches(seq_taxon.label, imap_dict[label])]
-            for label in self.get_taxa_labels()
+            [idx for idx, seq_taxon in enumerate(self.seq_data.taxon_namespace) if matches(seq_taxon.label, imap_dict[label])]
+            for label in self.network.get_taxa_labels()
         ]
 
         return taxa_partition
 
-    def pair_seq_data_rows_quartet_features(self, seq_data: "dendropy.DnaCharacterMatrix",
-                                                major_tree: "SpeciesNetwork",
-                                                taxa_partition: list[list] = None):
+    def pair_seq_data_rows_quartet_features(self):
         """
         Given seq_data and taxa_partition, we can select one individual per species to form a quartet matrix by
         choosing the rows (individuals) of seq_data. The choice of the four row indices is seq_data_rows.
@@ -639,18 +681,20 @@ class SpeciesNetwork:
         [[8, 9], [2, 3], [4, 5], [6, 7], [0, 1]].
         """
         # Step 1: Taxa partitions.
-        if taxa_partition is None:
+        if self.imap_path is None:
             taxa_partition = [
                 # seq_data row indices of the taxa that contains the species name in the network
-                [idx for idx, taxon in enumerate(seq_data.taxon_namespace) if label in taxon.label]
-                for label in self.get_taxa_labels()
+                [idx for idx, taxon in enumerate(self.seq_data.taxon_namespace) if label in taxon.label]
+                for label in self.network.get_taxa_labels()
             ]
+        else:
+            taxa_partition = self.get_taxa_partition()
 
         # Step 2: Get all one-individual-per-species mappings (row indices of seq_data) according to taxa_partition.
         one_indiv_per_species_maps = product(*taxa_partition)
 
         # Step 3: Get all possible quartet features from self
-        all_quartet_features = self.get_all_quartet_features(major_tree)
+        all_quartet_features = self.feature_extractor.get_all_quartet_features()
 
         # Step 4: Pair up seq_data_rows with the corresponding quartet features (param_idx, is_asymm, taxa_perm, gamma_id)
         dict_paired_feature = {}
@@ -833,6 +877,7 @@ class NetworkParameters:
     HAS-A TreeParameters instance and HAS-A GammaParameters instance.
     """
     def __init__(self, tree_params: TreeParameters, gamma_params: GammaParameters):
+        self.values = np.concatenate([self.tree.values, self.gamma.values])
         self.tree = tree_params      # NetworkParameters HAS-A TreeParameters
         self.gamma = gamma_params    # NetworkParameters HAS-A GammaParameters
         self.tree_values = tree_params.values
@@ -845,10 +890,6 @@ class NetworkParameters:
             tree_params=TreeParameters(values=np.asarray(tree_vec)),
             gamma_params=GammaParameters(values=np.asarray(gamma_vec))
         )
-
-    def to_vector(self):
-        """Flattens back into a combined parameter array if required by optimization solvers."""
-        return np.concatenate([self.tree.values, self.gamma.values])
 
 
 #################################################################################################
@@ -1218,6 +1259,119 @@ class SymmQuartet(QuartetTreeTopology):
 ## (param_idx, topology, taxa_perm, gamma_id). This section handles classes regarding quartet features.     ##
 ##############################################################################################################
 
+def identify_site_pattern_index(site_pattern):
+    """Given an input site pattern with length four, identify the corresponding index."""
+
+    from collections import Counter
+
+    # site_pattern = np.array(['A', 'A', 'A', 'C']) # Example site for testing
+    repeated_nucleo_count = len(np.unique(site_pattern))
+    if repeated_nucleo_count == 1:
+        # xxxx - 0
+        site_pattern_idx = 0
+    elif repeated_nucleo_count == 2:
+        # store the unique nucleotides with corresponding counts in a site
+        unique_nucleo = Counter(site_pattern)
+        if max(unique_nucleo.values()) == 3:
+            least_freq_nucleo = min(unique_nucleo, key=unique_nucleo.get)
+            locations = np.where(site_pattern == least_freq_nucleo)[0][0]  # location of least frequent nucleotide
+            # xxxy - 1. Least frequent nucleotide location is 3
+            # xxyx - 2. Least frequent nucleotide location is 2
+            # xyxx - 3. Least frequent nucleotide location is 1
+            # yxxx - 4. Least frequent nucleotide location is 0
+            site_pattern_idx = int(4 - locations)
+        else:  # elif max(unique_nucleo.values()) == 2:
+            locations = np.where(site_pattern == site_pattern[0])[0][1]
+            if locations == 2:
+                # xyxy - 5. Second appearance of the first nucleotide (x) is location 2
+                site_pattern_idx = 5
+            elif locations == 3:
+                # yxxy - 6. Second appearance of the first nucleotide (y) is location 3
+                site_pattern_idx = 6
+            else:  # elif locations == 1:
+                # xxyy - 7. Second appearance of the first nucleotide (x) is location 1
+                site_pattern_idx = 7
+    elif repeated_nucleo_count == 3:
+        unique_nucleo = Counter(site_pattern)
+        most_freq_nucleo = max(unique_nucleo, key=unique_nucleo.get)
+        locations = np.where(site_pattern == most_freq_nucleo)[0]
+        if np.all(locations == [0, 2]):
+            # xyxz - 8. Most frequent nucleotide location is [0,2]
+            site_pattern_idx = 8
+        elif np.all(locations == [0, 3]):
+            # xyzx - 9. Most frequent nucleotide location is [0,3]
+            site_pattern_idx = 9
+        elif np.all(locations == [1, 2]):
+            # yxxz - 10. Most frequent nucleotide location is [1,2]
+            site_pattern_idx = 10
+        elif np.all(locations == [1, 3]):
+            # yxzx - 11. Most frequent nucleotide location is [1,3]
+            site_pattern_idx = 11
+        elif np.all(locations == [0, 1]):
+            # xxyz - 12. Most frequent nucleotide location is [0,1]
+            site_pattern_idx = 12
+        else:  # elif np.all(locations == [2,3]):
+            # yzxx - 13. Most frequent nucleotide location is [2,3]
+            site_pattern_idx = 13
+    else:  # elif repeated_nucleo_count == 4:
+        # xyzw - 14
+        site_pattern_idx = 14
+
+    return site_pattern_idx
+
+# # Below are codes for generating the SITE_PATTERN_RELATIONSHIPS mapping.
+# import numpy as np
+# import itertools
+# index_to_pattern = np.array([
+#     ["x", "x", "x", "x"],  # 0
+#     ["x", "x", "x", "y"],  # 1
+#     ["x", "x", "y", "x"],  # 2
+#     ["x", "y", "x", "x"],  # 3
+#     ["y", "x", "x", "x"],  # 4
+#     ["x", "y", "x", "y"],  # 5
+#     ["y", "x", "x", "y"],  # 6
+#     ["x", "x", "y", "y"],  # 7
+#     ["x", "y", "x", "z"],  # 8
+#     ["x", "y", "z", "x"],  # 9
+#     ["y", "x", "x", "z"],  # 10
+#     ["y", "x", "z", "x"],  # 11
+#     ["x", "x", "y", "z"],  # 12
+#     ["y", "z", "x", "x"],  # 13
+#     ["x", "y", "z", "w"]   # 14
+# ])
+# SITE_PATTERN_RELATIONSHIPS = {
+# perm: [identify_site_pattern_index(sp)
+#        for sp in index_to_pattern[:, perm]]
+# for perm in itertools.permutations([0, 1, 2, 3])
+# }
+
+# For each taxa permutation, get the site pattern relationship from SITE_PATTERN_RELATIONSHIPS
+SITE_PATTERN_RELATIONSHIPS = {
+    (0, 1, 2, 3): [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+    (0, 1, 3, 2): [0, 2, 1, 3, 4, 6, 5, 7, 9, 8, 11, 10, 12, 13, 14],
+    (0, 2, 1, 3): [0, 1, 3, 2, 4, 7, 6, 5, 12, 9, 10, 13, 8, 11, 14],
+    (0, 2, 3, 1): [0, 2, 3, 1, 4, 7, 5, 6, 12, 8, 11, 13, 9, 10, 14],
+    (0, 3, 1, 2): [0, 3, 1, 2, 4, 6, 7, 5, 9, 12, 13, 10, 8, 11, 14],
+    (0, 3, 2, 1): [0, 3, 2, 1, 4, 5, 7, 6, 8, 12, 13, 11, 9, 10, 14],
+    (1, 0, 2, 3): [0, 1, 2, 4, 3, 6, 5, 7, 10, 11, 8, 9, 12, 13, 14],
+    (1, 0, 3, 2): [0, 2, 1, 4, 3, 5, 6, 7, 11, 10, 9, 8, 12, 13, 14],
+    (1, 2, 0, 3): [0, 1, 3, 4, 2, 6, 7, 5, 10, 13, 12, 9, 8, 11, 14],
+    (1, 2, 3, 0): [0, 2, 3, 4, 1, 5, 7, 6, 11, 13, 12, 8, 9, 10, 14],
+    (1, 3, 0, 2): [0, 3, 1, 4, 2, 7, 6, 5, 13, 10, 9, 12, 8, 11, 14],
+    (1, 3, 2, 0): [0, 3, 2, 4, 1, 7, 5, 6, 13, 11, 8, 12, 9, 10, 14],
+    (2, 0, 1, 3): [0, 1, 4, 2, 3, 7, 5, 6, 12, 11, 8, 13, 10, 9, 14],
+    (2, 0, 3, 1): [0, 2, 4, 1, 3, 7, 6, 5, 12, 10, 9, 13, 11, 8, 14],
+    (2, 1, 0, 3): [0, 1, 4, 3, 2, 5, 7, 6, 8, 13, 12, 11, 10, 9, 14],
+    (2, 1, 3, 0): [0, 2, 4, 3, 1, 6, 7, 5, 9, 13, 12, 10, 11, 8, 14],
+    (2, 3, 0, 1): [0, 3, 4, 1, 2, 5, 6, 7, 8, 10, 9, 11, 13, 12, 14],
+    (2, 3, 1, 0): [0, 3, 4, 2, 1, 6, 5, 7, 9, 11, 8, 10, 13, 12, 14],
+    (3, 0, 1, 2): [0, 4, 1, 2, 3, 5, 7, 6, 11, 12, 13, 8, 10, 9, 14],
+    (3, 0, 2, 1): [0, 4, 2, 1, 3, 6, 7, 5, 10, 12, 13, 9, 11, 8, 14],
+    (3, 1, 0, 2): [0, 4, 1, 3, 2, 7, 5, 6, 13, 8, 11, 12, 10, 9, 14],
+    (3, 1, 2, 0): [0, 4, 2, 3, 1, 7, 6, 5, 13, 9, 10, 12, 11, 8, 14],
+    (3, 2, 0, 1): [0, 4, 3, 1, 2, 6, 5, 7, 10, 8, 11, 9, 13, 12, 14],
+    (3, 2, 1, 0): [0, 4, 3, 2, 1, 5, 6, 7, 11, 9, 10, 8, 13, 12, 14]}
+
 @dataclass
 class QuartetTreeFeature:
     """Encapsulates quartet features (param_idx, topology, taxa_perm, gamma_id) for a single displayed quartet subtree."""
@@ -1225,6 +1379,34 @@ class QuartetTreeFeature:
     topology: QuartetTreeTopology  # Instance of AsymmQuartet or SymmQuartet
     taxa_perm: list[int]
     gamma_id: list[int]
+
+    @property
+    def num_retic(self):
+        """Total number of gamma parameters in the species network."""
+        if not self.gamma_id:
+            return 0
+        return len(self.gamma_id)
+
+    def get_site_pattern_relationship(self, inverse: bool = False):
+        """
+        Get the site pattern relationship vector (a list that permutes the indexing of the 15 category site pattern)
+        given the taxa permutation from the quartet feature.
+        """
+        taxa_perm = tuple(np.argsort(self.taxa_perm)) if inverse else tuple(self.taxa_perm)
+        return SITE_PATTERN_RELATIONSHIPS[taxa_perm]
+
+    def get_site_pattern_map_matrix(self, inverse: bool = False):
+        """
+        Get the site pattern mapping matrix (a linear transformation matrix that permutes the 15 categories site pattern
+        by matrix multiplication) given the taxa permutation from the quartet feature.
+        """
+
+        relationship = self.get_site_pattern_relationship(inverse)
+        rows = np.arange(15)
+        map_matrix = np.zeros((15, 15), dtype=int)
+        map_matrix[rows, relationship] = 1
+
+        return map_matrix
 
 
 @dataclass
@@ -1265,147 +1447,10 @@ class QuartetFeature:
 
     @property
     def num_retic(self):
-        """Total number of gamma parameters."""
-        return self.gamma_id.size
-
-    @staticmethod
-    def identify_site_pattern_index(site_pattern):
-        """Given an input site pattern with length four, identify the corresponding index."""
-
-        from collections import Counter
-
-        # site_pattern = np.array(['A', 'A', 'A', 'C']) # Example site for testing
-        repeated_nucleo_count = len(np.unique(site_pattern))
-        if repeated_nucleo_count == 1:
-            # xxxx - 0
-            site_pattern_idx = 0
-        elif repeated_nucleo_count == 2:
-            # store the unique nucleotides with corresponding counts in a site
-            unique_nucleo = Counter(site_pattern)
-            if max(unique_nucleo.values()) == 3:
-                least_freq_nucleo = min(unique_nucleo, key=unique_nucleo.get)
-                locations = np.where(site_pattern == least_freq_nucleo)[0][0]  # location of least frequent nucleotide
-                # xxxy - 1. Least frequent nucleotide location is 3
-                # xxyx - 2. Least frequent nucleotide location is 2
-                # xyxx - 3. Least frequent nucleotide location is 1
-                # yxxx - 4. Least frequent nucleotide location is 0
-                site_pattern_idx = int(4 - locations)
-            else:  # elif max(unique_nucleo.values()) == 2:
-                locations = np.where(site_pattern == site_pattern[0])[0][1]
-                if locations == 2:
-                    # xyxy - 5. Second appearance of the first nucleotide (x) is location 2
-                    site_pattern_idx = 5
-                elif locations == 3:
-                    # yxxy - 6. Second appearance of the first nucleotide (y) is location 3
-                    site_pattern_idx = 6
-                else:  # elif locations == 1:
-                    # xxyy - 7. Second appearance of the first nucleotide (x) is location 1
-                    site_pattern_idx = 7
-        elif repeated_nucleo_count == 3:
-            unique_nucleo = Counter(site_pattern)
-            most_freq_nucleo = max(unique_nucleo, key=unique_nucleo.get)
-            locations = np.where(site_pattern == most_freq_nucleo)[0]
-            if np.all(locations == [0, 2]):
-                # xyxz - 8. Most frequent nucleotide location is [0,2]
-                site_pattern_idx = 8
-            elif np.all(locations == [0, 3]):
-                # xyzx - 9. Most frequent nucleotide location is [0,3]
-                site_pattern_idx = 9
-            elif np.all(locations == [1, 2]):
-                # yxxz - 10. Most frequent nucleotide location is [1,2]
-                site_pattern_idx = 10
-            elif np.all(locations == [1, 3]):
-                # yxzx - 11. Most frequent nucleotide location is [1,3]
-                site_pattern_idx = 11
-            elif np.all(locations == [0, 1]):
-                # xxyz - 12. Most frequent nucleotide location is [0,1]
-                site_pattern_idx = 12
-            else:  # elif np.all(locations == [2,3]):
-                # yzxx - 13. Most frequent nucleotide location is [2,3]
-                site_pattern_idx = 13
-        else:  # elif repeated_nucleo_count == 4:
-            # xyzw - 14
-            site_pattern_idx = 14
-
-        return site_pattern_idx
-
-    @staticmethod
-    def get_site_pattern_relationship(taxa_perm, inverse: bool = False):
-        """
-        Get the site pattern relationship vector (a list that permutes the indexing of the 15 category site pattern)
-        given the taxa permutation from the quartet feature.
-        """
-        # # Below are codes for generating the dict_relationship mapping.
-        # import numpy as np
-        # import itertools
-        # index_to_pattern = np.array([
-        #     ["x", "x", "x", "x"],  # 0
-        #     ["x", "x", "x", "y"],  # 1
-        #     ["x", "x", "y", "x"],  # 2
-        #     ["x", "y", "x", "x"],  # 3
-        #     ["y", "x", "x", "x"],  # 4
-        #     ["x", "y", "x", "y"],  # 5
-        #     ["y", "x", "x", "y"],  # 6
-        #     ["x", "x", "y", "y"],  # 7
-        #     ["x", "y", "x", "z"],  # 8
-        #     ["x", "y", "z", "x"],  # 9
-        #     ["y", "x", "x", "z"],  # 10
-        #     ["y", "x", "z", "x"],  # 11
-        #     ["x", "x", "y", "z"],  # 12
-        #     ["y", "z", "x", "x"],  # 13
-        #     ["x", "y", "z", "w"]   # 14
-        # ])
-        # dict_relationship = {
-        # perm: [QuartetFeature.identify_site_pattern_index(sp)
-        #        for sp in index_to_pattern[:, perm]]
-        # for perm in itertools.permutations([0, 1, 2, 3])
-        # }
-
-        # For each taxa permutation, get the site pattern relationship from dict_relationship
-        dict_relationship = {
-            (0, 1, 2, 3): [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
-            (0, 1, 3, 2): [0, 2, 1, 3, 4, 6, 5, 7, 9, 8, 11, 10, 12, 13, 14],
-            (0, 2, 1, 3): [0, 1, 3, 2, 4, 7, 6, 5, 12, 9, 10, 13, 8, 11, 14],
-            (0, 2, 3, 1): [0, 2, 3, 1, 4, 7, 5, 6, 12, 8, 11, 13, 9, 10, 14],
-            (0, 3, 1, 2): [0, 3, 1, 2, 4, 6, 7, 5, 9, 12, 13, 10, 8, 11, 14],
-            (0, 3, 2, 1): [0, 3, 2, 1, 4, 5, 7, 6, 8, 12, 13, 11, 9, 10, 14],
-            (1, 0, 2, 3): [0, 1, 2, 4, 3, 6, 5, 7, 10, 11, 8, 9, 12, 13, 14],
-            (1, 0, 3, 2): [0, 2, 1, 4, 3, 5, 6, 7, 11, 10, 9, 8, 12, 13, 14],
-            (1, 2, 0, 3): [0, 1, 3, 4, 2, 6, 7, 5, 10, 13, 12, 9, 8, 11, 14],
-            (1, 2, 3, 0): [0, 2, 3, 4, 1, 5, 7, 6, 11, 13, 12, 8, 9, 10, 14],
-            (1, 3, 0, 2): [0, 3, 1, 4, 2, 7, 6, 5, 13, 10, 9, 12, 8, 11, 14],
-            (1, 3, 2, 0): [0, 3, 2, 4, 1, 7, 5, 6, 13, 11, 8, 12, 9, 10, 14],
-            (2, 0, 1, 3): [0, 1, 4, 2, 3, 7, 5, 6, 12, 11, 8, 13, 10, 9, 14],
-            (2, 0, 3, 1): [0, 2, 4, 1, 3, 7, 6, 5, 12, 10, 9, 13, 11, 8, 14],
-            (2, 1, 0, 3): [0, 1, 4, 3, 2, 5, 7, 6, 8, 13, 12, 11, 10, 9, 14],
-            (2, 1, 3, 0): [0, 2, 4, 3, 1, 6, 7, 5, 9, 13, 12, 10, 11, 8, 14],
-            (2, 3, 0, 1): [0, 3, 4, 1, 2, 5, 6, 7, 8, 10, 9, 11, 13, 12, 14],
-            (2, 3, 1, 0): [0, 3, 4, 2, 1, 6, 5, 7, 9, 11, 8, 10, 13, 12, 14],
-            (3, 0, 1, 2): [0, 4, 1, 2, 3, 5, 7, 6, 11, 12, 13, 8, 10, 9, 14],
-            (3, 0, 2, 1): [0, 4, 2, 1, 3, 6, 7, 5, 10, 12, 13, 9, 11, 8, 14],
-            (3, 1, 0, 2): [0, 4, 1, 3, 2, 7, 5, 6, 13, 8, 11, 12, 10, 9, 14],
-            (3, 1, 2, 0): [0, 4, 2, 3, 1, 7, 6, 5, 13, 9, 10, 12, 11, 8, 14],
-            (3, 2, 0, 1): [0, 4, 3, 1, 2, 6, 5, 7, 10, 8, 11, 9, 13, 12, 14],
-            (3, 2, 1, 0): [0, 4, 3, 2, 1, 5, 6, 7, 11, 9, 10, 8, 13, 12, 14]}
-
-        if inverse:
-            return dict_relationship[tuple(np.argsort(taxa_perm))]
-        else:
-            return dict_relationship[tuple(taxa_perm)]
-
-    @staticmethod
-    def get_site_pattern_map_matrix(taxa_perm, inverse: bool = False):
-        """
-        Get the site pattern mapping matrix (a linear transformation matrix that permutes the 15 categories site pattern
-        by matrix multiplication) given the taxa permutation from the quartet feature.
-        """
-
-        relationship = QuartetFeature.get_site_pattern_relationship(taxa_perm, inverse)
-        rows = np.arange(15)
-        map_matrix = np.zeros((15, 15), dtype=int)
-        map_matrix[rows, relationship] = 1
-
-        return map_matrix
+        """Number of reticulations in the quartet subnetwork."""
+        if not self.tree_features:
+            return 0
+        return len(self.tree_features[0].gamma_id)
 
     def get_true_probs(self, net_params: NetworkParameters, alpha: float = 4 / 3):
         """
@@ -1427,7 +1472,7 @@ class QuartetFeature:
 
             # 2. Get quartet parameters + site pattern mapping
             tau1, tau2, tau3, theta = net_params.tree.get_tau_theta(qt_feat.param_idx)
-            sp_relation = QuartetFeature.get_site_pattern_relationship(qt_feat.taxa_perm)
+            sp_relation = qt_feat.get_site_pattern_relationship()
 
             # 3. Compute site pattern probabilities (symmetric / asymmetric)
             p_Qt = qt_feat.topology.get_true_probs(tau1, tau2, tau3, theta, alpha)
