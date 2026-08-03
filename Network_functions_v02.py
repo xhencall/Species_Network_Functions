@@ -16,6 +16,7 @@ from phylox import suppress_node
 from dataclasses import dataclass
 from itertools import combinations, product
 from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
 
 ############################################
 ## Class for phylox network manipulation  ##
@@ -644,11 +645,11 @@ class QuartetFeaturePairer:
     def get_taxa_partition(self):
         """Produce tax_partition from user input Imap file"""
         # Read the Imap file into a dictionary
-        imap_dict = {}
+        imap_dict = defaultdict(list)
         with open(self.imap_path, "r") as f:
             for line in f:
                 old_name, species = line.strip().split()
-                imap_dict.setdefault(species,[]).append(old_name)
+                imap_dict[species].append(old_name)
 
         # Returns True when seq_taxon_name matches any one of the imap_names
         def matches(seq_taxon_name, imap_names):
@@ -1261,9 +1262,6 @@ class SymmQuartet(QuartetTreeTopology):
 
 def identify_site_pattern_index(site_pattern):
     """Given an input site pattern with length four, identify the corresponding index."""
-
-    from collections import Counter
-
     # site_pattern = np.array(['A', 'A', 'A', 'C']) # Example site for testing
     repeated_nucleo_count = len(np.unique(site_pattern))
     if repeated_nucleo_count == 1:
@@ -1507,32 +1505,58 @@ class PairedQuartetFeature:
 
 
 
-########################################################
-## Get site pattern counts of data and of each quartet ##
-########################################################
+##############################################################
+## dataclass container of site pattern counts (n^D and n^Q) ##
+##############################################################
 
-def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_missing=False):
-    """Get the observed site pattern counts n^D in data and corresponding site pattern ID."""
+@dataclass
+class FullSitePatterns:
+    """Encapsulates full dataset observed site patterns (n^D) and site pattern ID codes."""
+    id_code: np.ndarray  # Shape: (n_unique_sites, n_taxa_sequences)
+    n_D: np.ndarray  # Shape: (n_unique_sites,) Observed counts in data
 
-    from collections import defaultdict
+@dataclass
+class QuartetData:
+    """Encapsulates quartet observed site pattern count (n_Q), transformation matrix (E), and associated QuartetFeature."""
+    n_Q: np.ndarray  # Shape: (15,)
+    E_mat: np.matrix  # Shape: (15, len(n_D))
+    quartet_feature: QuartetFeature
 
-    if ACGT_weight is None:
-        ACGT_weight = [1, 1, 1, 1]
 
-    # Extract sequence of each taxa by self tip order into a list, and reformat the elements (nucleotides) into string format
-    sequence_matrix = [[str(element) for element in seq_data[taxon.label]] for taxon in seq_data.taxon_namespace]
 
-    # Use numpy to transpose the sequence matrix so that the rows are site patterns
-    site_pattern_array = np.array(sequence_matrix).T
+########################################################################
+## Parse sequence data with ambiguity code for likelihood calculation ##
+########################################################################
 
-    # count unique site patterns of the original sequence matrix
-    full_unique_site, full_unique_site_count = np.unique(site_pattern_array, axis=0, return_counts=True)
+class SequenceDataProcessor:
+    """Processes sequence alignment data, resolves ambiguity codes, and computes global site pattern counts (n^D)."""
 
-    # Task 1: Expand each unique site (w/ ambiguity code) into list of possible sites (w/o ambiguity) with weight proportions.
-    # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as key.
-    # Task 3: Assign weighted unique_site_count to the site pattern by key (site pattern identification code) and
-    #         collapse site pattern counts with the same key.
-    def site_pattern_IDcode(site_pattern):
+    IUPAC_MAP = {
+        'A': {'A'}, 'C': {'C'}, 'G': {'G'}, 'T': {'T'},
+        'R': {'A', 'G'}, 'Y': {'C', 'T'}, 'S': {'G', 'C'}, 'W': {'A', 'T'},
+        'K': {'G', 'T'}, 'M': {'A', 'C'}, 'B': {'C', 'G', 'T'},
+        'D': {'A', 'G', 'T'}, 'H': {'A', 'C', 'T'}, 'V': {'A', 'C', 'G'},
+        'N': {'A', 'C', 'G', 'T'}
+    }
+
+    def __init__(self,
+                 seq_data: "dendropy.DnaCharacterMatrix",
+                 acgt_weight: list[float] = None,
+                 skip_gap: bool = False,
+                 skip_missing: bool = False):
+        self.seq_data = seq_data
+        self.acgt_weight = acgt_weight if acgt_weight is not None else [1.0, 1.0, 1.0, 1.0]
+        self.skip_gap = skip_gap
+        self.skip_missing = skip_missing
+        self.weight_map = {
+            'A': self.acgt_weight[0],
+            'C': self.acgt_weight[1],
+            'G': self.acgt_weight[2],
+            'T': self.acgt_weight[3]
+        }
+
+    @staticmethod
+    def site_pattern_id_code(site_pattern: np.ndarray):
         """
         Convert a site pattern (in nucleotides) into ID code composed of x,y,z,w.
         When multiple nucleotides have the same frequency in a site pattern, the first nucleotide encountered
@@ -1541,8 +1565,6 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
         ['A', 'A', 'A', 'G', 'G', 'C', 'C', 'T'] => 'xxxyyzzw' by first appearance order. G appears first than C.
         ['A', 'A', 'A', 'G', 'G', 'C', 'C', 'T'] => 'xxxzzyyw' by alphabetical order. C is before G alphabetically.
         """
-        from collections import Counter
-
         # Count nucleotide frequencies. We use 'x' to denote the most frequent nucleotide and so on for 'y','z','w'.
         counts = Counter(site_pattern)
 
@@ -1569,471 +1591,284 @@ def get_n_D_hasAmbiguityCode(seq_data, ACGT_weight=None, skip_gap=False, skip_mi
 
         return code
 
-    def expand_weighted_site_pattern(site, ACGT_weight):
+    def expand_weighted_site_pattern(self, site: np.ndarray):
         """
         Expand a site pattern with ambiguity code into list of possible site patterns with weight proportions.
         This function allows ambiguity code for site pattern counting.
         """
-        from itertools import product
-
-        # IUPAC ambiguity code mapping
-        ambiguity_code_map = {
-            'A': {'A'},
-            'C': {'C'},
-            'G': {'G'},
-            'T': {'T'},
-            'R': {'A', 'G'},
-            'Y': {'C', 'T'},
-            'S': {'G', 'C'},
-            'W': {'A', 'T'},
-            'K': {'G', 'T'},
-            'M': {'A', 'C'},
-            'B': {'C', 'G', 'T'},
-            'D': {'A', 'G', 'T'},
-            'H': {'A', 'C', 'T'},
-            'V': {'A', 'C', 'G'},
-            'N': {'A', 'C', 'G', 'T'}
-        }
-
-        # Fast lookup map for weights to avoid calling .index() repeatedly inside the loop
-        weight_map = {'A': ACGT_weight[0], 'C': ACGT_weight[1], 'G': ACGT_weight[2], 'T': ACGT_weight[3]}
-
         # Map each character in the site pattern to its possible nucleotides
-        nucleotide_options = [ambiguity_code_map[char] for char in site]
+        nucleotide_options = [self.IUPAC_MAP[char] for char in site]
 
         # Generate all combinations using product
         expanded_site_patterns = [np.array(site) for site in product(*nucleotide_options)]
 
         # Calculate the weight of each pattern using the fast lookup dictionary
         site_pattern_weights = np.prod(
-            [[weight_map[nuc] for nuc in site_pattern] for site_pattern in expanded_site_patterns],
+            [[self.weight_map[nuc] for nuc in site_pattern] for site_pattern in expanded_site_patterns],
             axis=1
         )
         site_pattern_weight_proportions = site_pattern_weights / site_pattern_weights.sum()
 
         return zip(expanded_site_patterns, site_pattern_weight_proportions)
 
-    # --- Vectorized Pre-processing of Gaps and Missing Data ---
-    # Create a boolean mask of which sites to keep
-    keep_mask = np.ones(len(full_unique_site), dtype=bool)
-    if skip_gap:
-        keep_mask &= ~(full_unique_site == '-').any(axis=1)  # keep_mask = False when site includes "-"
-    if skip_missing:
-        keep_mask &= ~(full_unique_site == '?').any(axis=1)  # keep_mask = False when site includes "?"
+    def get_full_site_pattern(self):
+        """Get the full dataset observed site pattern counts (n^D) and corresponding site pattern ID code."""
+        # Extract sequence of each taxa by self tip order into a list, and reformat the elements (nucleotides) into string format
+        sequence_matrix = [[str(element) for element in self.seq_data[taxon.label]] for taxon in self.seq_data.taxon_namespace]
 
-    # Filter arrays using the mask and copy to prevent mutating the original sequences
-    filtered_sites = full_unique_site[keep_mask].copy()
-    filtered_counts = full_unique_site_count[keep_mask]
+        # Use numpy to transpose the sequence matrix so that the rows are site patterns
+        site_pattern_array = np.array(sequence_matrix).T
 
-    # Vectorized replacement of remaining gaps/missing data with 'N'
-    if not skip_gap:
-        filtered_sites[filtered_sites == '-'] = 'N'
-    if not skip_missing:
-        filtered_sites[filtered_sites == '?'] = 'N'
+        # count unique site patterns of the original sequence matrix
+        full_unique_site, full_unique_site_count = np.unique(site_pattern_array, axis=0, return_counts=True)
 
-    # --- Main Processing Loop ---
-    dict_n_D = defaultdict(float)
-
-    for unique_site, count in zip(filtered_sites, filtered_counts):
         # Task 1: Expand each unique site (w/ ambiguity code) into list of possible sites (w/o ambiguity) with weight proportions.
-        for site, weight in expand_weighted_site_pattern(unique_site, ACGT_weight):
-            # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as dict_key.
-            key_IDcode = tuple(site_pattern_IDcode(site))
+        # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as key.
+        # Task 3: Assign weighted unique_site_count to the site pattern by key (site pattern identification code) and
+        #         collapse site pattern counts with the same key.
 
-            # Task 3: Accumulate weighted counts to the same site pattern ID
-            dict_n_D[key_IDcode] += weight * count
+        # --- Vectorized Pre-processing of Gaps and Missing Data ---
+        # Create a boolean mask to filter gaps and missing data
+        keep_mask = np.ones(len(full_unique_site), dtype=bool)
+        if self.skip_gap:
+            keep_mask &= ~(full_unique_site == '-').any(axis=1)  # keep_mask = False when site includes "-"
+        if self.skip_missing:
+            keep_mask &= ~(full_unique_site == '?').any(axis=1)  # keep_mask = False when site includes "?"
 
-    # Extract collapsed result from dictionary
-    collapsed_IDcode = np.array(list(dict_n_D.keys()))
-    collapsed_n_D    = np.fromiter(dict_n_D.values(), dtype=np.float64)
+        # Filter arrays using the mask and copy to prevent mutating the original sequences
+        filtered_sites = full_unique_site[keep_mask].copy()
+        filtered_counts = full_unique_site_count[keep_mask]
 
-    return collapsed_IDcode, collapsed_n_D
+        # Vectorized replacement of remaining gaps/missing data with 'N'
+        if not self.skip_gap:
+            filtered_sites[filtered_sites == '-'] = 'N'
+        if not self.skip_missing:
+            filtered_sites[filtered_sites == '?'] = 'N'
+
+        # --- Main Processing Loop ---
+        dict_n_D = defaultdict(float)
+
+        for unique_site, count in zip(filtered_sites, filtered_counts):
+            # Task 1: Expand each unique site (w/ ambiguity code) into list of possible sites (w/o ambiguity) with weight proportions.
+            for site, weight in self.expand_weighted_site_pattern(unique_site):
+                # Task 2: Convert site patterns into an identification code (by x,y,z,w) and use it as dict_key.
+                key_id_code = tuple(self.site_pattern_id_code(site))
+
+                # Task 3: Accumulate weighted counts to the same site pattern ID
+                dict_n_D[key_id_code] += weight * count
+
+        # Extract collapsed result from dictionary
+        collapsed_id_code = np.array(list(dict_n_D.keys()))
+        collapsed_n_D = np.fromiter(dict_n_D.values(), dtype=np.float64)
+
+        return FullSitePatterns(collapsed_id_code, collapsed_n_D)
 
 
-def get_quartet_site_pattern_count_map_matrix(quartet_sites, collapsed_site_pattern_count):
+class SitePatternCounter:
     """
-    Count 15 category site patterns of a quartet from collapsed_site_pattern_count and generate a mapping matrix
-    from site pattern counts of data (n^D) to quartet site pattern counts (n^Q).
-    xxxx - 0
-    xxxy - 1
-    xxyx - 2
-    xyxx - 3
-    yxxx - 4
-    xyxy - 5
-    yxxy - 6
-    xxyy - 7
-    xyxz - 8
-    xyzx - 9
-    yxxz - 10
-    yxzx - 11
-    xxyz - 12
-    yzxx - 13
-    xyzw - 14
+    Projects 4-taxon site patterns into 15 fundamental categories, calculates transformation matrix E (n^Q = E * n^D),
+    coordinates pairing features, extracting site pattern counts n^Q, and optional data compression.
     """
-    from collections import Counter
 
-    def get_quartet_unique_sites(quartet_sites, unique_site_count):
-        """Collapse unique_site_count of data matrix for a quartet."""
+    def __init__(self,
+                 network: SpeciesNetwork,
+                 major_tree: SpeciesNetwork,
+                 seq_data: "dendropy.DnaCharacterMatrix",
+                 imap_path: str | None = None,
+                 acgt_weight: list[float] | None = None,
+                 skip_gap: bool = False,
+                 skip_missing: bool = False):
 
-        # quartet_unique_site_InvIndex are the first occurrence index of quartet_unique_site
-        quartet_unique_site, quartet_unique_site_InvIndex = np.unique(quartet_sites, axis=0, return_inverse=True)
+        self.network = network
+        self.major_tree = major_tree
+        self.seq_data = seq_data
+
+        # Instantiate dependencies via Composition
+        self.feature_pairer = QuartetFeaturePairer(network, major_tree, seq_data, imap_path)
+        self.data_processor = SequenceDataProcessor(seq_data, acgt_weight, skip_gap, skip_missing)
+
+    @staticmethod
+    def get_n_Q_and_E_matrix(quartet_sites: np.ndarray, n_D: np.ndarray):
+        """
+        Count 15 category site patterns of a quartet from collapsed_site_pattern_count (n_D) and generate a mapping matrix
+        (E) that mapps from site pattern counts of data (n^D) to quartet site pattern counts (n^Q). That is, n^Q = E * n^D.
+        xxxx - 0
+        xxxy - 1
+        xxyx - 2
+        xyxx - 3
+        yxxx - 4
+        xyxy - 5
+        yxxy - 6
+        xxyy - 7
+        xyxz - 8
+        xyzx - 9
+        yxxz - 10
+        yxzx - 11
+        xxyz - 12
+        yzxx - 13
+        xyzw - 14
+        """
+        # quartet_unique_site_inv_index are the first occurrence index of quartet_unique_site
+        quartet_unique_site, quartet_unique_site_inv_index = np.unique(quartet_sites, axis=0, return_inverse=True)
 
         # Use np.bincount to sum counts based on the unique site indices
-        quartet_unique_site_count = np.bincount(quartet_unique_site_InvIndex, weights=unique_site_count)
+        quartet_unique_site_count = np.bincount(quartet_unique_site_inv_index, weights=n_D)
 
-        return quartet_unique_site, quartet_unique_site_count, quartet_unique_site_InvIndex
+        n_Q = np.zeros(15)
+        e_matrix = np.matrix(np.zeros((15, len(n_D)), dtype=int))
 
-    site_pattern_counts = np.zeros(15)
+        for j, unique_site in enumerate(quartet_unique_site):
+            # For the j^th unique site, "np.where(quartet_unique_site_inv_index == j)[0]" gives the vector of indices of
+            # where this unique site appears in its original collapsed_site_pattern_count.
+    
+            # unique_site = np.array(['A', 'T', 'A', 'C']) # Example site for testing
+            col_idx = np.where(quartet_unique_site_inv_index == j)[0]
+            cat_idx = identify_site_pattern_index(unique_site)
 
-    # Maps from the site pattern counts of data to the 15 category site pattern counts
-    mapping_matrix = np.matrix(np.zeros((15,len(collapsed_site_pattern_count)), dtype=int))
+            n_Q[cat_idx] += quartet_unique_site_count[j]
+            e_matrix[cat_idx, col_idx] = 1
 
-    # 15 category site pattern counts: unique sites (quartet_unique_site) and collapsed counts (quartet_unique_site_count).
-    # Mapping matrix: the inverse indices of the unique sites (quartet_unique_site_InvIndex)
-    (quartet_unique_site, quartet_unique_site_count,
-     quartet_unique_site_InvIndex) = get_quartet_unique_sites(quartet_sites, collapsed_site_pattern_count)
+        return n_Q, e_matrix
 
-    for j, unique_site in enumerate(quartet_unique_site):
-        # For the j^th unique site, "np.where(quartet_unique_site_InvIndex == j)[0]" gives the vector of indices of
-        # where this unique site appears in its original collapsed_site_pattern_count.
+    @staticmethod
+    def make_dict_key(q_feature: QuartetFeature):
+        """Create an immutable, unique hash key based on quartet features."""
+        param_idx = q_feature.param_idx
+        # reshape is_asymm into a column vector
+        is_asymm_col = q_feature.is_asymm[:, None]
+        taxa_perm = q_feature.taxa_perm
+        gamma_id = q_feature.gamma_id
 
-        # unique_site = np.array(['A', 'T', 'A', 'C']) # Example site for testing
-        repeated_nucleo_count = len(np.unique(unique_site))
-        if repeated_nucleo_count == 1:
-            # xxxx - 0
-            site_pattern_counts[0] += quartet_unique_site_count[j]
-            mapping_matrix[0, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-        elif repeated_nucleo_count == 2:
-            # store the unique nucleotides with corresponding counts in a site
-            unique_nucleo = Counter(unique_site)
-            if max(unique_nucleo.values()) == 3:
-                least_freq_nucleo = min(unique_nucleo, key=unique_nucleo.get)
-                locations = np.where(unique_site == least_freq_nucleo)[0]  # location of least frequent nucleotide
-                # xxxy - 1. Least frequent nucleotide location is 3
-                # xxyx - 2. Least frequent nucleotide location is 2
-                # xyxx - 3. Least frequent nucleotide location is 1
-                # yxxx - 4. Least frequent nucleotide location is 0
-                site_pattern_counts[4 - locations] += quartet_unique_site_count[j]
-                mapping_matrix[4 - locations, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            else:  # elif max(unique_nucleo.values()) == 2:
-                locations = np.where(unique_site == unique_site[0])[0][1]
-                if locations == 2:
-                    # xyxy - 5. Second appearance of the first nucleotide (x) is location 2
-                    site_pattern_counts[5] += quartet_unique_site_count[j]
-                    mapping_matrix[5, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-                elif locations == 3:
-                    # yxxy - 6. Second appearance of the first nucleotide (y) is location 3
-                    site_pattern_counts[6] += quartet_unique_site_count[j]
-                    mapping_matrix[6, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-                else:  # elif locations == 1:
-                    # xxyy - 7. Second appearance of the first nucleotide (x) is location 1
-                    site_pattern_counts[7] += quartet_unique_site_count[j]
-                    mapping_matrix[7, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-        elif repeated_nucleo_count == 3:
-            unique_nucleo = Counter(unique_site)
-            most_freq_nucleo = max(unique_nucleo, key=unique_nucleo.get)
-            locations = np.where(unique_site == most_freq_nucleo)[0]
-            if np.all(locations == [0, 2]):
-                # xyxz - 8. Most frequent nucleotide location is [0,2]
-                site_pattern_counts[8] += quartet_unique_site_count[j]
-                mapping_matrix[8, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            elif np.all(locations == [0, 3]):
-                # xyzx - 9. Most frequent nucleotide location is [0,3]
-                site_pattern_counts[9] += quartet_unique_site_count[j]
-                mapping_matrix[9, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            elif np.all(locations == [1, 2]):
-                # yxxz - 10. Most frequent nucleotide location is [1,2]
-                site_pattern_counts[10] += quartet_unique_site_count[j]
-                mapping_matrix[10, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            elif np.all(locations == [1, 3]):
-                # yxzx - 11. Most frequent nucleotide location is [1,3]
-                site_pattern_counts[11] += quartet_unique_site_count[j]
-                mapping_matrix[11, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            elif np.all(locations == [0, 1]):
-                # xxyz - 12. Most frequent nucleotide location is [0,1]
-                site_pattern_counts[12] += quartet_unique_site_count[j]
-                mapping_matrix[12, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-            else:  # elif np.all(locations == [2,3]):
-                # yzxx - 13. Most frequent nucleotide location is [2,3]
-                site_pattern_counts[13] += quartet_unique_site_count[j]
-                mapping_matrix[13, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
-        else:  # elif repeated_nucleo_count == 4:
-            # xyzw - 14
-            site_pattern_counts[14] += quartet_unique_site_count[j]
-            mapping_matrix[14, np.where(quartet_unique_site_InvIndex == j)[0]] = 1
+        # Stack row-wise: [param_idx | is_asymm | taxa_perm | gamma_id]
+        combined = np.concatenate([param_idx, is_asymm_col, taxa_perm, gamma_id], axis=1)
 
-    return site_pattern_counts, mapping_matrix
+        return tuple(tuple(row) for row in combined)
+
+    def get_parsed_data_net(self):
+        """
+        Output all quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute true
+        site pattern probabilities (p_Q) for each combination of four taxa. Also output E_mat and n_D used to compute
+        the variability J and sensitivity H matrices.
+        """
+        # -------------------------------------------------------------------------
+        # 1. Get paired quartet features for all "one lineage per species" quartet subtree from data.
+        # -------------------------------------------------------------------------
+        paired_features = self.feature_pairer.pair_seq_data_rows_quartet_features()
+
+        # -------------------------------------------------------------------------
+        # 2. Compute full site-pattern count n^D with ambiguity code handling
+        # -------------------------------------------------------------------------
+        site_pattern_data = self.data_processor.get_full_site_pattern()
+
+        # -------------------------------------------------------------------------
+        # 3. Accumulate to collapse quartets with identical quartet features
+        # -------------------------------------------------------------------------
+        all_quartet_data = []
+        for pf in paired_features:
+            # Get the quartet site pattern array by the row_idx
+            quartet_sites = site_pattern_data.id_code[:, pf.seq_data_rows]
+
+            # Get n_Q and its mapping matrix e_mat such that n_Q = e_mat @ n_D
+            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, site_pattern_data.n_D)
+
+            all_quartet_data.append(QuartetData(n_Q, e_mat, pf.quartet_feature))
+
+        # -------------------------------------------------------------------------
+        # 4. Output all quartet data: list[(n_Q, E_mat, QuartetFeature)], and site_pattern_data: (id_code, n_D)
+        # -------------------------------------------------------------------------
+        return all_quartet_data, site_pattern_data
+
+
+    def get_parsed_data_net_compressed(self):
+        """
+        Output compressed quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute
+        true site pattern probabilities (p_Q) for each combination of four taxa. Also output e_mat and n_D used to
+        compute the variability J and sensitivity H matrices.
+        Reduced parsed_data_net is used only to improve the computation time of SpeciesNetwork_CompLogLik.
+        """
+        # -------------------------------------------------------------------------
+        # 1. Get paired quartet features for all "one lineage per species" quartet subtree from data.
+        # -------------------------------------------------------------------------
+        paired_features = self.feature_pairer.pair_seq_data_rows_quartet_features()
+
+        # -------------------------------------------------------------------------
+        # 2. Compute full site-pattern count n^D with ambiguity code handling
+        # -------------------------------------------------------------------------
+        site_pattern_data = self.data_processor.get_full_site_pattern()
+
+        # -------------------------------------------------------------------------
+        # 3. Accumulate to collapse quartets with identical quartet features
+        # -------------------------------------------------------------------------
+        dict_n_Q = defaultdict(float)
+        dict_E_mat = {}
+        dict_q_feature = {}
+        for pf in paired_features:
+            # Get the quartet site pattern array by the row_idx
+            quartet_sites = site_pattern_data.id_code[:, pf.seq_data_rows]
+
+            # Get n_Q and its mapping matrix e_mat such that n_Q = e_mat @ n_D
+            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, site_pattern_data.n_D)
+
+            # Convert everything to immutable tuples used as dictionary key
+            dict_key = self.make_dict_key(pf.quartet_feature)
+
+            ## Use quartet features as key to get compressed quartet site pattern counts.
+            dict_n_Q[dict_key] += n_Q
+            dict_E_mat[dict_key] = e_mat
+            dict_q_feature[dict_key] = pf.quartet_feature
+
+        # -------------------------------------------------------------------------
+        # 4. Output exported compressed quartet information
+        # -------------------------------------------------------------------------
+        compressed_quartet_data = [
+            QuartetData(
+                n_Q=np.array(dict_n_Q[key]),
+                E_mat=dict_E_mat[key],
+                quartet_feature=dict_q_feature[key]
+            )
+            for key in dict_n_Q
+        ]
+
+        return compressed_quartet_data, site_pattern_data
+
+    @staticmethod
+    def to_compressed_quartet_data(all_quartet_data: list[QuartetData]):
+        """
+        From all_quartet_data as input, output compressed_quartet_data to avoid recalculating.
+        """
+        dict_n_Q = defaultdict(float)
+        dict_E_mat = {}
+        dict_q_feature = {}
+
+        # Loop directly over the outputs from get_parsed_data_net()
+        for q_data in all_quartet_data:
+            # Convert everything to immutable tuples using your original logic
+            dict_key = SitePatternCounter.make_dict_key(q_data.quartet_feature)
+
+            # Use quartet features as key to get compressed quartet site pattern counts.
+            dict_n_Q[dict_key] += q_data.n_Q
+            dict_E_mat[dict_key] = q_data.E_mat
+            dict_q_feature[dict_key] = q_data.quartet_feature
+
+        # -------------------------------------------------------------------------
+        # Output exported compressed quartet information
+        # -------------------------------------------------------------------------
+        compressed_quartet_data = [
+            QuartetData(
+                n_Q=np.array(dict_n_Q[key]),
+                E_mat=dict_E_mat[key],
+                quartet_feature=dict_q_feature[key]
+            )
+            for key in dict_n_Q
+        ]
+
+        return compressed_quartet_data, site_pattern_data
+
 
 
 #####################################################
 ## Compute composite likelihood of species network ##
 #####################################################
-
-def get_taxa_partition(seq_data, phylox_network, Imap_file_path):
-    """Produce tax_partition from user input Imap file"""
-    from collections import defaultdict
-
-    # Read the Imap file into a dictionary
-    imap_dict = defaultdict(list)
-    with open(Imap_file_path, "r") as f:
-        for line in f:
-            old_name, species = line.strip().split()
-            imap_dict[species].append(old_name)
-
-    # Returns True when seq_taxon_name matches any one of the imap_names
-    def matches(seq_taxon_name, imap_names):
-        for name in imap_names:
-            # Replace space with underscore if there is any
-            if ' ' in seq_taxon_name:
-                seq_taxon_name = seq_taxon_name.replace(" ", "_")
-            # Remove caret ^ before taxon name
-            if name == seq_taxon_name.lstrip("^"):
-                return True
-        return False
-
-    taxa_partition = [
-        # seq_data row indices of the taxa that contains the species name in the self
-        [idx for idx, seq_taxon in enumerate(seq_data.taxon_namespace) if matches(seq_taxon.label, imap_dict[label])]
-        for label in get_taxa_labels(phylox_network)
-    ]
-
-    return taxa_partition
-
-
-def pair_quartetRows_quartetFeatures(seq_data, phylox_network, major_tree, taxa_partition=None):
-    """
-    Given seq_data and taxa_partition, we can select one individual per species to form a quartet matrix by
-    choosing the rows (individuals) of seq_data. The choice of row indices that forms quartet matrix is
-    (quartet_rows). For each quartet_rows, we pair it up with the corresponding quartet features (param_idx,
-    is_asymm, taxa_perm, gamma_id).
-
-    This function handles data with multiple individuals per species through "taxa_partition". For example,
-    we have species tree ((E,B),((C,D),A)) and data = {A1,A2,B1,B2,C1,C2,D1,D2,E1,E2}, the taxa partition is
-    [[8, 9], [2, 3], [4, 5], [6, 7], [0, 1]].
-    """
-    from itertools import combinations, product
-
-    # Step 1: Taxa partitions.
-    if taxa_partition is None:
-        taxa_partition = [
-            # seq_data row indices of the taxa that contains the species name in the network
-            [idx for idx, taxon in enumerate(seq_data.taxon_namespace) if label in taxon.label]
-            for label in get_taxa_labels(phylox_network)
-        ]
-
-    # Step 2: Get all one-individual-per-species mappings (row indices of seq_data) according to taxa_partition.
-    all_1indivPerSpecies_maps = product(*taxa_partition)
-
-    # Step 3: Get all possible quartet features from self
-    all_param_idx, all_is_asymm, all_taxa_perm, all_gamma_id = get_all_quartet_features(phylox_network, major_tree)
-
-    # Step 4: Pair up quartet features (param_idx, is_asymm, taxa_perm, gamma_id) with the corresponding quartet_rows
-    dict_quartet_param_idx = {}
-    dict_quartet_is_asymm = {}
-    dict_quartet_taxa_perm = {}
-    dict_quartet_gamma_id = {}
-    for MAP in all_1indivPerSpecies_maps:
-        # For each all_1indivPerSpecies_maps, enumerate all possible combinations of 4 row indices of seq_data
-        # (quartet_rows).
-        for j, quartet_rows in enumerate(combinations(MAP, 4)):
-            # Since quartet_rows will appear twice, we use it as dictionary key to collapse repetition.
-            dict_key = tuple(quartet_rows)
-            dict_quartet_param_idx[dict_key] = all_param_idx[j]
-            dict_quartet_is_asymm[dict_key] = all_is_asymm[j]
-            dict_quartet_taxa_perm[dict_key] = all_taxa_perm[j]
-            dict_quartet_gamma_id[dict_key] = all_gamma_id[j]
-
-    # Extract collapsed result from dictionary
-    all_seq_data_rows        = list(dict_quartet_param_idx.keys())
-    all_quartet_param_idx      = list(dict_quartet_param_idx.values())
-    all_quartet_is_asymm        = list(dict_quartet_is_asymm.values())
-    all_quartet_taxa_perm      = list(dict_quartet_taxa_perm.values())
-    all_quartet_gamma_id       = list(dict_quartet_gamma_id.values())
-
-    return all_seq_data_rows, all_quartet_param_idx, all_quartet_is_asymm, all_quartet_taxa_perm, all_quartet_gamma_id
-
-
-def get_zippedData_net_reduced(seq_data, phylox_network, major_tree,
-                   taxa_partition=None, ACGT_weight=None, skip_gap=False, skip_missing=False):
-    """
-    Output reduced quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute
-    true site pattern probabilities (p_Q) for each combination of four taxa. Also output E_mat and n_D used to
-    compute the variability J and sensitivity H matrices.
-    Reduced zippedData_net is used only to improve the computation time of SpeciesNetwork_CompLogLik.
-    """
-
-    from collections import defaultdict
-    # -------------------------------------------------------------------------
-    # 1. Get quartet features for all "one lineage per species" quartet subtree from data.
-    # -------------------------------------------------------------------------
-    (all_seq_data_rows, all_quartet_param_idx, all_quartet_is_asymm, all_quartet_taxa_perm,
-     all_quartet_gamma_id) = pair_quartetRows_quartetFeatures(seq_data, phylox_network, major_tree, taxa_partition)
-
-    # -------------------------------------------------------------------------
-    # 2. Compute global site-pattern count with ambiguity handling
-    # -------------------------------------------------------------------------
-    collapsed_IDcode, n_D = get_n_D_hasAmbiguityCode(seq_data, ACGT_weight, skip_gap, skip_missing)
-
-    # -------------------------------------------------------------------------
-    # 3. Dictionary accumulation to collapse quartets with identical quartet features
-    # -------------------------------------------------------------------------
-    dict_site_pattern_count = defaultdict(int)
-    dict_param_idx = {}
-    dict_is_asymm = {}
-    dict_taxa_perm = {}
-    dict_gamma_id = {}
-    dict_E_mat = defaultdict(list)
-
-    def make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id):
-        """Make these quartet features as one dictionary key."""
-        # reshape is_asymm into a column vector
-        is_asymm_col = is_asymm[:, None]  # shape (2,1)
-
-        # Stack row-wise: [param_idx | is_asymm | taxa_perm | gamma_id]
-        combined = np.concatenate(
-            [param_idx, is_asymm_col, taxa_perm, gamma_id],
-            axis=1
-        )
-
-        return tuple(tuple(row) for row in combined)
-
-    for row_idx, param_idx, is_asymm, taxa_perm, gamma_id in zip(all_seq_data_rows, all_quartet_param_idx,
-                                                all_quartet_is_asymm, all_quartet_taxa_perm, all_quartet_gamma_id):
-        # Get the quartet site pattern array by the row_idx
-        quartet_sites = collapsed_IDcode[:, row_idx]
-
-        # Get n_Q and its mapping matrix E_mat such that n_Q = E_mat @ n_D
-        n_Q, E_mat = get_quartet_site_pattern_count_map_matrix(quartet_sites, n_D)
-
-        # Convert everything to immutable tuples
-        dict_key = make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id)
-
-        ## Use quartet features as key to get reduced quartet site pattern counts.
-        dict_site_pattern_count[dict_key] += n_Q
-        dict_param_idx[dict_key]    = param_idx
-        dict_is_asymm[dict_key]      = is_asymm
-        dict_taxa_perm[dict_key]     = taxa_perm
-        dict_gamma_id[dict_key]     = gamma_id
-        dict_E_mat[dict_key]        = E_mat
-
-    # -------------------------------------------------------------------------
-    # 4. Output exported reduced quartet information
-    # -------------------------------------------------------------------------
-    reduced_site_pattern_count   = np.array(list(dict_site_pattern_count.values()))
-    reduced_param_idx           = list(dict_param_idx.values())
-    reduced_is_asymm             = list(dict_is_asymm.values())
-    reduced_taxa_perm            = list(dict_taxa_perm.values())
-    reduced_gamma_id            = list(dict_gamma_id.values())
-    reduced_E_mat               = list(dict_E_mat.values())
-
-    return (list(zip(reduced_site_pattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
-            reduced_E_mat, n_D)
-
-
-def compress_zippedData_net(zipped_data_net, all_E_mat, n_D):
-    """
-    Output reduced quartet-level site pattern counts (n_Q) with corresponding quartet features.
-    Takes the pre-computed zipped_data_net, all_E_mat, n_D from get_zippedData_net as input to avoid recalculating.
-    """
-    import numpy as np
-    from collections import defaultdict
-
-    dict_site_pattern_count = defaultdict(int)
-    dict_param_idx = {}
-    dict_is_asymm = {}
-    dict_taxa_perm = {}
-    dict_gamma_id = {}
-    dict_E_mat = {}
-
-    def make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id):
-        """Make these quartet features as one dictionary key."""
-        # reshape is_asymm into a column vector
-        is_asymm_col = is_asymm[:, None]  # shape (2,1)
-
-        # Stack row-wise: [param_idx | is_asymm | taxa_perm | gamma_id]
-        combined = np.concatenate(
-            [param_idx, is_asymm_col, taxa_perm, gamma_id],
-            axis=1
-        )
-
-        return tuple(tuple(row) for row in combined)
-
-    # Loop directly over the outputs from get_zippedData_net
-    for (n_Q, param_idx, is_asymm, taxa_perm, gamma_id), E_mat in zip(zipped_data_net, all_E_mat):
-        # Convert everything to immutable tuples using your original logic
-        dict_key = make_dict_key(param_idx, is_asymm, taxa_perm, gamma_id)
-
-        # Use quartet features as key to get reduced quartet site pattern counts.
-        dict_site_pattern_count[dict_key] += n_Q
-        dict_param_idx[dict_key] = param_idx
-        dict_is_asymm[dict_key] = is_asymm
-        dict_taxa_perm[dict_key] = taxa_perm
-        dict_gamma_id[dict_key] = gamma_id
-        dict_E_mat[dict_key] = E_mat
-
-    # -------------------------------------------------------------------------
-    # Output exported reduced quartet information
-    # -------------------------------------------------------------------------
-    reduced_site_pattern_count = np.array(list(dict_site_pattern_count.values()))
-    reduced_param_idx = list(dict_param_idx.values())
-    reduced_is_asymm = list(dict_is_asymm.values())
-    reduced_taxa_perm = list(dict_taxa_perm.values())
-    reduced_gamma_id = list(dict_gamma_id.values())
-    reduced_E_mat = list(dict_E_mat.values())
-
-    return (list(zip(reduced_site_pattern_count, reduced_param_idx, reduced_is_asymm, reduced_taxa_perm, reduced_gamma_id)),
-            reduced_E_mat, n_D)
-
-
-def get_zippedData_net(seq_data, phylox_network, major_tree,
-                       taxa_partition=None, ACGT_weight=None, skip_gap=False, skip_missing=False):
-    """
-    Output all quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute true
-    site pattern probabilities (p_Q) for each combination of four taxa. Also output E_mat and n_D used to compute
-    the variability J and sensitivity H matrices.
-    """
-
-    # -------------------------------------------------------------------------
-    # 1. Get quartet features for all "one lineage per species" quartet subtree from data.
-    # -------------------------------------------------------------------------
-    (all_seq_data_rows, all_quartet_param_idx, all_quartet_is_asymm, all_quartet_taxa_perm,
-     all_quartet_gamma_id) = pair_quartetRows_quartetFeatures(seq_data, phylox_network, major_tree, taxa_partition)
-
-    # -------------------------------------------------------------------------
-    # 2. Compute global site-pattern count with ambiguity handling
-    # -------------------------------------------------------------------------
-    collapsed_IDcode, n_D = get_n_D_hasAmbiguityCode(seq_data, ACGT_weight, skip_gap, skip_missing)
-
-    # -------------------------------------------------------------------------
-    # 3. For all quartets, store its site pattern counts and its quartet features
-    # -------------------------------------------------------------------------
-    all_n_Q = []
-    all_param_idx = []
-    all_is_asymm = []
-    all_taxa_perm = []
-    all_gamma_id = []
-    all_E_mat = []
-
-    for row_idx, param_idx, is_asymm, taxa_perm, gamma_id in zip(all_seq_data_rows, all_quartet_param_idx,
-                                                                all_quartet_is_asymm, all_quartet_taxa_perm,
-                                                                all_quartet_gamma_id):
-        # Get the quartet site pattern array by the row_idx
-        quartet_sites = collapsed_IDcode[:, row_idx]
-
-        # Get n_Q and its mapping matrix E_mat such that n_Q = E_mat @ n_D
-        n_Q, E_mat = get_quartet_site_pattern_count_map_matrix(quartet_sites, n_D)
-
-        all_n_Q.append(n_Q)
-        all_param_idx.append(param_idx)
-        all_is_asymm.append(is_asymm)
-        all_taxa_perm.append(taxa_perm)
-        all_gamma_id.append(gamma_id)
-        all_E_mat.append(E_mat)
-
-    # -------------------------------------------------------------------------
-    # 4. Output full quartet information
-    # -------------------------------------------------------------------------
-    return list(zip(all_n_Q, all_param_idx, all_is_asymm, all_taxa_perm, all_gamma_id)), all_E_mat, n_D
 
 
 def SpeciesNetwork_CompLogLik(zipped_data_net, parameters):
@@ -3284,7 +3119,7 @@ def get_Score_Vari_Sens_Mat(parameters, zipped_data_net, all_E_mat, n_D):
 
 def get_curvAdjust_matrix(MCLE, zipped_data_net, all_E_mat, n_D):
     """Use J_mat and H_mat derived from get_Vari_Sens_Mat() to get curvature adjustment matrix.
-    Use zipped_data_net from get_zippedData_net()."""
+    Use zipped_data_net from get_parsed_data_net()."""
     import numpy as np
 
     J_mat, H_mat = get_Vari_Sens_Mat(MCLE, zipped_data_net, all_E_mat, n_D)
@@ -3470,8 +3305,8 @@ def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    
                         nsample, thin, step_width, prop_kern=None,               # MCMC settings
                         thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,       # User costomized prior and MCLE
                         prog_bar = None):                                       # show progress bar: yes/no
-    """We use zipped_data_net from get_zippedData_net() to get MCLE and use zipped_data_net_reduced from
-    get_zippedData_net_reduced() to compute likelihood for a faster computation during MCMC runs."""
+    """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
+    get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
     from tqdm import trange     # Included to show progress bar
     import numpy as np
 
@@ -3593,8 +3428,8 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
                         nsample, thin, step_width, curvAdj, prop_kern=None,         # MCMC settings
                         thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,          # User costomized prior and MCLE
                         prog_bar = None):                                       # show progress bar: yes/no
-    """We use zipped_data_net from get_zippedData_net() to get MCLE and use zipped_data_net_reduced from
-    get_zippedData_net_reduced() to compute likelihood for a faster computation during MCMC runs."""
+    """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
+    get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
     from tqdm import trange     # Included to show progress bar
     import numpy as np
 
@@ -3730,8 +3565,8 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #                         nsample, thin, step_width, curvAdjust_matrix, prop_kern=None,  # MCMC settings
 #                         thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,  # User costomized prior and MCLE
 #                         prog_bar=None):  # show progress bar: yes/no
-#     """We use zipped_data_net from get_zippedData_net() to get MCLE and use zipped_data_net_reduced from
-#     get_zippedData_net_reduced() to compute likelihood for a faster computation during MCMC runs."""
+#     """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
+#     get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
 #     from tqdm import trange  # Included to show progress bar
 #     import numpy as np
 #
