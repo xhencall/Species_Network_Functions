@@ -6,9 +6,9 @@
 import numpy as np
 # np.set_printoptions(suppress=True, linewidth=np.nan)
 
-############################################
-## Tools for phylox network manipulation  ##
-############################################
+###############################
+## Import required packages  ##
+###############################
 import re, phylox, dendropy, itertools, warnings
 import networkx as nx
 from phylox.constants import LABEL_ATTR
@@ -17,6 +17,91 @@ from dataclasses import dataclass
 from itertools import combinations, product
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
+
+##############################################################
+## Graphical illustration of relationships between classes  ##
+##############################################################
+
+# =================== Regular Processing classes relationship diagram ===============
+#   ┌────────────────┐(passed to) ┌────────────────────────┐
+#   │ SpeciesNetwork │───────────►│ DisplayedTreeExtractor │
+#   └───────┬────────┘            └──────────┬─────────────┘
+#           └────────────────────────────┐   │
+#                                        │   │
+#                                        ▼   ▼
+#                                 ┌────────────────────────┐
+#                                 │ QuartetFeatureExtractor│
+#                                 └──────────┬─────────────┘
+#                                            │
+#                                       (passed to)
+#                                            │
+#                                            ▼
+#                                 ┌────────────────────────┐
+#                                 │  QuartetFeaturePairer  │
+#                                 └──────────┬─────────────┘
+#   ┌───────────────────────┐                │
+#   │ SequenceDataProcessor │────────────┐   │
+#   └───────────────────────┘            │   │
+#                                        ▼   ▼
+#                                 ┌────────────────────────┐
+#                                 │   SitePatternCounter   │
+#                                 └──────────┬─────────────┘
+#                                            │
+#                                 (outputs two data classes)
+#                                            │
+#                         ┌──────────────────┴────────────────────────┐
+# ======================= │ === Data classes relationship diagram === │ =========================
+#                         │    ┌──────────────┐   ┌──────────────┐    │
+#                         │    │ AsymmQuartet │   │ SymmQuartet  │    │
+#                         │    └──────┬───────┘   └──────┬───────┘    │
+#                         │           │  (subclasses of) │            │
+#                         │           └──────────┬───────┘            │
+#                         │                      │                    │
+#                         │                      ▼                    │
+#                         │          ┌──────────────────────┐         │
+#                         │          │ QuartetTreeTopology  │         │
+#                         │          └───────────┬──────────┘         │
+#                         │                      │                    │
+#                         │              (implemented in)             │
+#                         │                      │                    │
+#                         │                      ▼                    │
+#                         │          ┌──────────────────────┐         │
+#                         │          │  QuartetTreeFeature  │         │
+#                         │          └───────────┬──────────┘         │
+#                         │                      │                    │
+#                         │               (subclass of)               │
+#                         │                      │                    │
+#                         │                      ▼                    │
+#                         │          ┌──────────────────────┐         │
+#                         │          │    QuartetFeature    │         │
+#                         │          └───────────┬──────────┘         │
+#                         │                      │                    │
+#                         │               (subclass of)               │
+#                         │                      │                    │
+#                         │                      ▼                    │
+#                         │          ┌──────────────────────┐         │
+#                         │          │ PairedQuartetFeature │         │
+#                         │          └───────────┬──────────┘         │
+#                         │                      │                    │
+#                         │     (implemented by SitePatternCounter)   │
+#                         │                      │────────────────────┘
+#                         ▼                      ▼
+#           ┌─────────────────────┐    ┌──────────────────┐      ┌────────────────┐  ┌────────────────┐
+#           │  FullSitePatterns   │    │   QuartetData    │      │ TreeParameters │  │ GammaParameters│
+#           └─────────────────────┘    └────┬─────────┬───┘      └───────┬────────┘  └───────┬────────┘
+#                         │                 │         │                  │  (subclasses of)  │
+#                         │                 │         │                  └──────────┬────────┘
+#                         │                 │         │                             │
+#                         │                 │         │                             ▼
+#                         │                 │         │                  ┌────────────────────┐
+#                         │                 │         │                  │ NetworkParameters  │
+#                         │                 │         │                  └────────┬───────────┘
+#                         │                 │         └─────────────────┐         │
+#                         │                 │                           │         │
+#                         ▼                 ▼                           ▼         ▼
+#                   ┌───────────────────────────┐                  ┌────────────────────┐
+#                   │Curvature Adjustment Matrix│                  │Composite Likelihood│
+#                   └───────────────────────────┘                  └────────────────────┘
 
 ############################################
 ## Class for phylox network manipulation  ##
@@ -715,9 +800,9 @@ class QuartetFeaturePairer:
         return list(dict_paired_feature.values())
 
 
-###########################################################################
-## Class for manipulating parameters (tree_parameters, gamma_parameters) ##
-###########################################################################
+##########################################################################
+## Dataclass for network parameters (tree_parameters, gamma_parameters) ##
+##########################################################################
 
 @dataclass
 class TreeParameters:
@@ -1506,7 +1591,7 @@ class PairedQuartetFeature:
 
 
 ##############################################################
-## dataclass container of site pattern counts (n^D and n^Q) ##
+## Dataclass container of site pattern counts (n^D and n^Q) ##
 ##############################################################
 
 @dataclass
@@ -1524,9 +1609,9 @@ class QuartetData:
 
 
 
-########################################################################
-## Parse sequence data with ambiguity code for likelihood calculation ##
-########################################################################
+#################################################################################
+## Class to parse sequence data with ambiguity code for likelihood calculation ##
+#################################################################################
 
 class SequenceDataProcessor:
     """Processes sequence alignment data, resolves ambiguity codes, and computes global site pattern counts (n^D)."""
@@ -1678,7 +1763,6 @@ class SitePatternCounter:
                  acgt_weight: list[float] | None = None,
                  skip_gap: bool = False,
                  skip_missing: bool = False):
-
         self.network = network
         self.major_tree = major_tree
         self.seq_data = seq_data
@@ -1778,7 +1862,6 @@ class SitePatternCounter:
         # -------------------------------------------------------------------------
         return all_quartet_data, site_pattern_data
 
-
     def get_parsed_data_net_compressed(self):
         """
         Output compressed quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute
@@ -1862,14 +1945,12 @@ class SitePatternCounter:
             for key in dict_n_Q
         ]
 
-        return compressed_quartet_data, site_pattern_data
-
+        return compressed_quartet_data
 
 
 #####################################################
 ## Compute composite likelihood of species network ##
 #####################################################
-
 
 def SpeciesNetwork_CompLogLik(zipped_data_net, parameters):
     """Computes species network composite log likelihood."""
