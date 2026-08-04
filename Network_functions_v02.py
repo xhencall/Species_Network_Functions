@@ -27,19 +27,18 @@ from collections import Counter, defaultdict
 #   │ SpeciesNetwork │───────────►│ DisplayedTreeExtractor │
 #   └───────┬────────┘            └──────────┬─────────────┘
 #           └────────────────────────────┐   │
-#                                        │   │
+#                              (network) │   │ (major_tree)
 #                                        ▼   ▼
 #                                 ┌────────────────────────┐
 #                                 │ QuartetFeatureExtractor│
 #                                 └──────────┬─────────────┘
 #                                            │
-#                                       (passed to)
-#                                            │
+#                                            │ (add seq_data row indices)
 #                                            ▼
 #                                 ┌────────────────────────┐
 #                                 │  QuartetFeaturePairer  │
 #                                 └──────────┬─────────────┘
-#   ┌───────────────────────┐                │
+#   ┌───────────────────────┐ (id_code, n_D) │
 #   │ SequenceDataProcessor │────────────┐   │
 #   └───────────────────────┘            │   │
 #                                        ▼   ▼
@@ -47,7 +46,7 @@ from collections import Counter, defaultdict
 #                                 │   SitePatternCounter   │
 #                                 └──────────┬─────────────┘
 #                                            │
-#                                 (outputs two data classes)
+#                       (outputs data-classes: FullSitePatterns, QuartetData)
 #                                            │
 #                         ┌──────────────────┴────────────────────────┐
 # ======================= │ === Data classes relationship diagram === │ =========================
@@ -62,7 +61,7 @@ from collections import Counter, defaultdict
 #                         │          │ QuartetTreeTopology  │         │
 #                         │          └───────────┬──────────┘         │
 #                         │                      │                    │
-#                         │              (implemented in)             │
+#                         │                (is part of)               │
 #                         │                      │                    │
 #                         │                      ▼                    │
 #                         │          ┌──────────────────────┐         │
@@ -82,8 +81,8 @@ from collections import Counter, defaultdict
 #                         │          ┌──────────────────────┐         │
 #                         │          │ PairedQuartetFeature │         │
 #                         │          └───────────┬──────────┘         │
+#                         │     (Encapsulated by SitePatternCounter)  │
 #                         │                      │                    │
-#                         │     (implemented by SitePatternCounter)   │
 #                         │                      │────────────────────┘
 #                         ▼                      ▼
 #           ┌─────────────────────┐    ┌──────────────────┐      ┌────────────────┐  ┌────────────────┐
@@ -303,7 +302,7 @@ class SpeciesNetwork:
 
         # Get the speciation time index labeled on speciation_nodes by pre-order traversal
         try:
-            return np.array([self.get_label_from_node(node) for node in speciation_nodes], dtype=int)
+            return [int(self.get_label_from_node(node)) for node in speciation_nodes]
         except (KeyError, AttributeError) as e:
             raise ValueError(
                 f"Failed to get speciation time indices (param_idx) from input network. "
@@ -963,9 +962,9 @@ class NetworkParameters:
     HAS-A TreeParameters instance and HAS-A GammaParameters instance.
     """
     def __init__(self, tree_params: TreeParameters, gamma_params: GammaParameters):
-        self.values = np.concatenate([self.tree.values, self.gamma.values])
         self.tree = tree_params      # NetworkParameters HAS-A TreeParameters
         self.gamma = gamma_params    # NetworkParameters HAS-A GammaParameters
+        self.values = np.concatenate([self.tree.values, self.gamma.values])
         self.tree_values = tree_params.values
         self.gamma_values = gamma_params.values
 
@@ -1491,7 +1490,6 @@ class QuartetTreeFeature:
 
         return map_matrix
 
-
 @dataclass
 class QuartetFeature:
     """Encapsulates quartet features (param_idx, is_asymm, taxa_perm, gamma_id) for a 4-taxa subnetwork."""
@@ -1573,7 +1571,6 @@ class QuartetFeature:
             TrueProbs = all_p_Qt[0]
 
         return TrueProbs
-
 
 @dataclass
 class PairedQuartetFeature:
@@ -1712,13 +1709,15 @@ class SequenceDataProcessor:
         # Task 3: Assign weighted unique_site_count to the site pattern by key (site pattern identification code) and
         #         collapse site pattern counts with the same key.
 
-        # --- Vectorized Pre-processing of Gaps and Missing Data ---
-        # Create a boolean mask to filter gaps and missing data
-        keep_mask = np.ones(len(full_unique_site), dtype=bool)
+        # --- NumPy Vectorized Pre-processing of Gaps and Missing Data (Get a 1D boolean mask to filter) ---
+        # keep_mask &= ...: Updates keep_mask by performing an AND operation with previous results.
+        # ~ (Bitwise NOT): Inverts all the boolean values in the 2D boolean matrix (full_unique_site == '-').
+        # .any(axis=1): Evaluates across each row (axis=1) of the 2D boolean matrix.
+        keep_mask = np.ones(len(full_unique_site), dtype=np.bool)
         if self.skip_gap:
-            keep_mask &= ~(full_unique_site == '-').any(axis=1)  # keep_mask = False when site includes "-"
+            keep_mask &= ~(full_unique_site == '-').any(axis=1)  # keep_mask = False when row includes "-"
         if self.skip_missing:
-            keep_mask &= ~(full_unique_site == '?').any(axis=1)  # keep_mask = False when site includes "?"
+            keep_mask &= ~(full_unique_site == '?').any(axis=1)  # keep_mask = False when row includes "?"
 
         # Filter arrays using the mask and copy to prevent mutating the original sequences
         filtered_sites = full_unique_site[keep_mask].copy()
@@ -1842,7 +1841,7 @@ class SitePatternCounter:
         # -------------------------------------------------------------------------
         # 2. Compute full site-pattern count n^D with ambiguity code handling
         # -------------------------------------------------------------------------
-        site_pattern_data = self.data_processor.get_full_site_pattern()
+        full_site_pattern = self.data_processor.get_full_site_pattern()
 
         # -------------------------------------------------------------------------
         # 3. Accumulate to collapse quartets with identical quartet features
@@ -1850,24 +1849,24 @@ class SitePatternCounter:
         all_quartet_data = []
         for pf in paired_features:
             # Get the quartet site pattern array by the row_idx
-            quartet_sites = site_pattern_data.id_code[:, pf.seq_data_rows]
+            quartet_sites = full_site_pattern.id_code[:, pf.seq_data_rows]
 
             # Get n_Q and its mapping matrix e_mat such that n_Q = e_mat @ n_D
-            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, site_pattern_data.n_D)
+            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, full_site_pattern.n_D)
 
             all_quartet_data.append(QuartetData(n_Q, e_mat, pf.quartet_feature))
 
         # -------------------------------------------------------------------------
-        # 4. Output all quartet data: list[(n_Q, E_mat, QuartetFeature)], and site_pattern_data: (id_code, n_D)
+        # 4. Output all quartet data: list[(n_Q, E_mat, QuartetFeature)], and full_site_pattern: (id_code, n_D)
         # -------------------------------------------------------------------------
-        return all_quartet_data, site_pattern_data
+        return all_quartet_data, full_site_pattern
 
     def get_parsed_data_net_compressed(self):
         """
         Output compressed quartet-level site pattern counts (n_Q) with corresponding quartet features used to compute
         true site pattern probabilities (p_Q) for each combination of four taxa. Also output e_mat and n_D used to
         compute the variability J and sensitivity H matrices.
-        Reduced parsed_data_net is used only to improve the computation time of SpeciesNetwork_CompLogLik.
+        Reduced parsed_data_net is used only to improve the computation time of get_network_comp_log_lik.
         """
         # -------------------------------------------------------------------------
         # 1. Get paired quartet features for all "one lineage per species" quartet subtree from data.
@@ -1877,7 +1876,7 @@ class SitePatternCounter:
         # -------------------------------------------------------------------------
         # 2. Compute full site-pattern count n^D with ambiguity code handling
         # -------------------------------------------------------------------------
-        site_pattern_data = self.data_processor.get_full_site_pattern()
+        full_site_pattern = self.data_processor.get_full_site_pattern()
 
         # -------------------------------------------------------------------------
         # 3. Accumulate to collapse quartets with identical quartet features
@@ -1887,10 +1886,10 @@ class SitePatternCounter:
         dict_q_feature = {}
         for pf in paired_features:
             # Get the quartet site pattern array by the row_idx
-            quartet_sites = site_pattern_data.id_code[:, pf.seq_data_rows]
+            quartet_sites = full_site_pattern.id_code[:, pf.seq_data_rows]
 
             # Get n_Q and its mapping matrix e_mat such that n_Q = e_mat @ n_D
-            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, site_pattern_data.n_D)
+            n_Q, e_mat = self.get_n_Q_and_E_matrix(quartet_sites, full_site_pattern.n_D)
 
             # Convert everything to immutable tuples used as dictionary key
             dict_key = self.make_dict_key(pf.quartet_feature)
@@ -1912,7 +1911,7 @@ class SitePatternCounter:
             for key in dict_n_Q
         ]
 
-        return compressed_quartet_data, site_pattern_data
+        return compressed_quartet_data, full_site_pattern
 
     @staticmethod
     def to_compressed_quartet_data(all_quartet_data: list[QuartetData]):
@@ -1952,14 +1951,15 @@ class SitePatternCounter:
 ## Compute composite likelihood of species network ##
 #####################################################
 
-def SpeciesNetwork_CompLogLik(zipped_data_net, parameters):
+def get_network_comp_log_lik(all_quartet_data: list[QuartetData,...],
+                              network_parameters: NetworkParameters):
     """Computes species network composite log likelihood."""
-    CompLogLik = 0
-    for n_Q, param_idx, is_asymm, taxa_perm, gamma_id in zipped_data_net:
-        TrueProbs = getTrueProbsQuartet(parameters, param_idx, is_asymm, taxa_perm, gamma_id)
-        CompLogLik += np.sum(n_Q * np.log(TrueProbs))
+    comp_log_lik = 0
+    for qd in all_quartet_data:
+        true_probs = qd.quartet_feature.get_true_probs(network_parameters)
+        comp_log_lik += np.sum(qd.n_Q * np.log(true_probs))
 
-    return CompLogLik
+    return comp_log_lik
 
 
 ########################################################
@@ -2136,7 +2136,7 @@ def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, 
                 return np.inf
             raw_param = np.concatenate((raw_tree_param, gamma_parameters))
             try:
-                return -SpeciesNetwork_CompLogLik(zipped_data_net, raw_param)
+                return -get_network_comp_log_lik(zipped_data_net, raw_param)
             except:
                 return np.inf
 
@@ -2187,7 +2187,7 @@ def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, 
             return np.inf
 
         try:
-            return -SpeciesNetwork_CompLogLik(zipped_data_net, params)
+            return -get_network_comp_log_lik(zipped_data_net, params)
         except FloatingPointError:
             print("Floating point error at x =", x)
             raise
@@ -3433,7 +3433,7 @@ def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    
     MCMC_samples = []
     curr_param = MCLE.copy()
     # Calculate the starting states ONCE before the loop begins. Update them only when proposal accepted.
-    curr_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, curr_param)
+    curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_param)
 
     # Progress bar setup
     total_iter = int(nsample * thin)
@@ -3448,7 +3448,7 @@ def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    
         # curr_loglik have been calculated before Step 1
         curr_logprior = log_invgamma(curr_param[J], a_theta,b_theta)
         new_param[J] = proposal_kernel(curr_param[J], step_width[1], (5e-5, 0.2), prop_kern)
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_param)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
         new_logprior = log_invgamma(new_param[J], a_theta,b_theta)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior+new_loglik - curr_logprior-curr_loglik:
@@ -3462,7 +3462,7 @@ def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    
         # curr_loglik have been updated before Step 2
         curr_logprior = log_prior_tau(curr_param[:J], a_tau,b_tau)
         new_param[:J] = proposal_kernel(curr_param[:J], step_width[0], get_tau_boundaries(curr_param[:J]), prop_kern)
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_param)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
         new_logprior = log_prior_tau(new_param[:J], a_tau,b_tau)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3476,7 +3476,7 @@ def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    
         # curr_loglik have been updated before Step 3
         curr_logprior = log_beta(curr_param[-h:], a_gamma, b_gamma)
         new_param[-h:] = proposal_kernel(curr_param[-h:], step_width[2], gamma_bound, prop_kern)
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_param)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
         new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3558,7 +3558,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
     C = np.asarray(curvAdj)
     # Calculate the starting states ONCE before the loop begins. Update them only when proposal accepted.
     curr_star = MCLE + C @ (curr_param - MCLE)
-    curr_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, curr_star)
+    curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_star)
 
     # Progress bar setup
     total_iter = int(nsample * thin)
@@ -3577,7 +3577,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
             new_star = MCLE + C @ (new_param - MCLE)
             if tau_in_constraints(new_star[:J]) and new_star[J]>0:
                 break
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
         new_logprior = log_invgamma(new_param[J], a_theta,b_theta)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior+new_loglik - curr_logprior-curr_loglik:
@@ -3595,7 +3595,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
             new_star = MCLE + C @ (new_param - MCLE)
             if tau_in_constraints(new_star[:J]) and new_star[J]>0:
                 break
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
         new_logprior = log_prior_tau(new_param[:J], a_tau,b_tau)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3613,7 +3613,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
             new_star = MCLE + C @ (new_param - MCLE)
             if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
                 break
-        new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
         new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
         # accept or reject new proposal
         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3691,7 +3691,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #     C = np.asarray(curvAdjust_matrix)
 #
 #     curr_star = MCLE + C @ (curr_param - MCLE)
-#     curr_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, curr_star)
+#     curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_star)
 #
 #     total_iter = int(nsample * thin)
 #     if prog_bar is None or prog_bar:
@@ -3710,7 +3710,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #             new_star = MCLE + C @ (new_param - MCLE)
 #             if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
 #                 break
-#         new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+#         new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
 #         new_logprior = log_invgamma(new_param[J], a_theta, b_theta)
 #
 #         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3735,7 +3735,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #                 if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
 #                     break
 #
-#             new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+#             new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
 #             new_logprior = log_prior_tau(new_param[:J], a_tau, b_tau)
 #
 #             if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3754,7 +3754,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #             new_star = MCLE + C @ (new_param - MCLE)
 #             if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
 #                 break
-#         new_loglik = SpeciesNetwork_CompLogLik(zipped_data_net_reduce, new_star)
+#         new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
 #         new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
 #
 #         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
@@ -3856,7 +3856,7 @@ def modified_CompLik_ratio_stat(zipped_data_net, all_E_mat, n_D, phylox_network,
         """𝜼 = (τ_1,...,τ_{N+h-1},θ) and γ = (γ_1,...,γ_h) are evaluated jointly in this function so that
         we can jointly optimize 𝜼 and γ in l_MP(𝜼,γ)."""
         gamma = params[-h:]
-        numerator = SpeciesNetwork_CompLogLik(zipped_data_net, params) - CL_opt
+        numerator = get_network_comp_log_lik(zipped_data_net, params) - CL_opt
         denominator = (- T_p(gamma).T @ H_p @ T_p(gamma) + U_pc.T @ H_p_inv @ U_pc)[0,0]
         phi_p = numerator / denominator if numerator != 0 else 1/2
         return phi_p
