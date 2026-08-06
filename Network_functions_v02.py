@@ -11,12 +11,13 @@ import numpy as np
 ###############################
 import re, phylox, dendropy, itertools, warnings
 import networkx as nx
+from abc import ABC, abstractmethod
 from phylox.constants import LABEL_ATTR
 from phylox import suppress_node
 from dataclasses import dataclass
 from itertools import combinations, product
-from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
+from scipy.optimize import minimize
 
 ##############################################################
 ## Graphical illustration of relationships between classes  ##
@@ -127,6 +128,11 @@ class SpeciesNetwork:
         """total number of tau parameters"""
         return self.num_taxa + self.num_retic - 1
 
+    @property
+    def internal_nodes(self):
+        """Get internal nodes (out-degree > 0)"""
+        return [node for node in self.nodes if self.out_degree(node) > 0]
+
     def __getattr__(self, name: str):
         """
         If an attribute or method isn't found on SpeciesNetwork, Python automatically redirects the call to
@@ -157,10 +163,7 @@ class SpeciesNetwork:
         Remove labels from all internal nodes of a PhyloX network. A node is considered internal if its out-degree > 0
         (i.e., it is not a leaf_node).
         """
-        # Internal nodes (out-degree > 0)
-        internal_nodes = self.internal_nodes()
-
-        for node in internal_nodes:
+        for node in self.internal_nodes:
             # Remove label stored in LABEL_ATTR
             if LABEL_ATTR in self.nodes[node]:
                 self.erase_label_in_node(node)
@@ -173,12 +176,9 @@ class SpeciesNetwork:
         Label speciation time indices by preorder traversal of internal nodes.
         Nodes that are predecessors of the same reticulation share the same label.
         """
-        # Internal nodes (out-degree > 0)
-        internal_nodes = self.internal_nodes()
-
         label_index = self.num_tau  # total number of tau parameters
 
-        for node in internal_nodes:
+        for node in self.internal_nodes:
             self.write_label_in_node(label_index, node)
             label_index -= 1
 
@@ -278,10 +278,6 @@ class SpeciesNetwork:
                 else:
                     stack.extend(children)
         return leaf_labels
-
-    def internal_nodes(self):
-        """Get internal nodes (out-degree > 0)"""
-        return [node for node in self.nodes if self.out_degree(node) > 0]
 
     def get_parameter_idx(self):
         """
@@ -442,7 +438,7 @@ class SpeciesNetwork:
 
         self.phylox_network = ladderized_net
 
-    def sorting_asymmetric_quartet(self):
+    def permute_asymm_quartet(self):
         """
         Get the taxa permutation to ladderize an input quartet_tree into a sorted
         asymmetric quartet: (A,((B,C),D)) -> (A,(D,(B,C))).
@@ -669,12 +665,12 @@ class QuartetFeatureExtractor:
         # Create empty lists
         quartet_features_list = []
 
-        for taxa_comb in four_taxa_combs:
+        for taxa_tuple in four_taxa_combs:
             # Use param_idx as dict key to deduplicates identical quartets and store other features in dict
             unique_tree_features = {}
 
             # Pre-convert the tuple to a list once per quartet
-            taxa_list = list(taxa_comb)
+            taxa_list = list(taxa_tuple)
 
             for disp_tree, gamma_id in all_disp_tree_gamma_id:
                 # Prune the displayed tree to keep only the current set of four taxa
@@ -690,7 +686,7 @@ class QuartetFeatureExtractor:
                 is_asymm = AsymmQuartet() if labeled_quartet.is_asymmetric_quartet() else SymmQuartet()
 
                 # Only sort the asymmetric quartet
-                taxa_perm = quartet_network.sorting_asymmetric_quartet() if is_asymm else [0, 1, 2, 3]
+                taxa_perm = quartet_network.permute_asymm_quartet() if isinstance(is_asymm,AsymmQuartet) else [0, 1, 2, 3]
 
                 qt_feature = QuartetTreeFeature(
                     param_idx   =   param_idx,
@@ -703,7 +699,7 @@ class QuartetFeatureExtractor:
 
             # Create a structured QuartetFeature object
             q_feature = QuartetFeature(
-                taxa = taxa_comb,
+                taxa = taxa_tuple,
                 tree_features = list(unique_tree_features.values())
             )
             quartet_features_list.append(q_feature)
@@ -967,6 +963,8 @@ class NetworkParameters:
         self.values = np.concatenate([self.tree.values, self.gamma.values])
         self.tree_values = tree_params.values
         self.gamma_values = gamma_params.values
+        self.num_tau = self.tree.num_tau
+        self.num_retic = self.gamma.num_retic
 
     @classmethod
     def from_vectors(cls, tree_vec, gamma_vec):
@@ -982,11 +980,16 @@ class NetworkParameters:
 #################################################################################################
 
 class QuartetTreeTopology(ABC):
-    """Abstract Strategy representing is_asymm of a 4-taxa subtree."""
+    """Abstract Strategy representing is_asymm of a 4-taxa subtree. Implemented in QuartetFeature"""
 
     @abstractmethod
     def get_true_probs(self, t1: float, t2: float, t3: float, theta: float, alpha: float = 4 / 3):
         """Computes 15-category site pattern probabilities for this quartet subtree."""
+        pass
+    
+    @abstractmethod
+    def get_MOM_tau(self, p_hat_Q, theta):
+        """Computes MOM estimators of [tau1, tau2, tau3] for this quartet subtree. tau3 is root age."""
         pass
 
 class AsymmQuartet(QuartetTreeTopology):
@@ -1206,6 +1209,41 @@ class AsymmQuartet(QuartetTreeTopology):
 
         return weights * p_15  # 11-category site pattern probabilities
 
+    @property
+    def MOM_mat(self):
+        # Asymmetric case
+        W_a = np.matrix([
+            [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]
+        ])
+        Coef_a = np.matrix([
+            [3, -7, 10, 9, -5, 8, -8, 18, -10, -12, -6],
+            [3, 5, -2, 9, 7, -4, -8, -6, -10, 12, -6],
+            [3, 10, 5, -3, 2, 1, 2, -6, 4, -12, -6]
+        ])
+        WA_pinv = np.linalg.inv(W_a.T @ W_a) @ W_a.T  # pseudo-inverse
+        return Coef_a @ WA_pinv  # Precompute full transformation matrix
+
+    def get_MOM_tau(self, p_hat_Q, theta):
+        """Returns MOM estimators of [tau1, tau2, tau3] of asymmetric quartet. tau3 is root age."""
+        mu = 4 / 3
+        y = np.array((4 / 3) * (1 + mu * 2 * theta) * (self.MOM_mat @ p_hat_Q)).ravel()
+        MOM_tau = -np.log(y ** (1 / (2 * mu)))
+        return MOM_tau
+
 class SymmQuartet(QuartetTreeTopology):
     """Symmetric Quartet Topology Strategy: ((A,B),(C,D))"""
 
@@ -1337,6 +1375,41 @@ class SymmQuartet(QuartetTreeTopology):
         weights[14] = 24  # 4*3*2*1=24 ways of xyzw-14
 
         return weights * p_15  # weighted 15-category site pattern probabilities
+
+    @property
+    def MOM_mat(self):
+        # Symmetric case
+        W_s = np.matrix([
+            [4, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 12, 0, 0, 0, 0, 0, 0, 0],
+            [0, 12, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 12, 0, 0, 0, 0, 0, 0],
+            [0, 0, 12, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 12, 0, 0, 0, 0, 0],
+            [0, 0, 0, 12, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 12, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 0, 0, 24, 0],
+            [0, 0, 0, 0, 0, 24, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 24, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0, 24]
+        ])
+        Coef_s = np.matrix([
+            [1, -2, 6, -2, 3, -2, 6, -8, -2],
+            [1, 6, -2, -2, 3, 6, -2, -8, -2],
+            [1, 2, 2, 2, -1, -2, -2, 0, -2]
+        ])
+        WS_pinv = np.linalg.inv(W_s.T @ W_s) @ W_s.T  # pseudo-inverse
+        return Coef_s @ WS_pinv  # Precompute full transformation matrix
+
+    def get_MOM_tau(self, p_hat_Q, theta):
+        """Returns MOM estimators of [tau1, tau2, tau3] of symmetric quartet. tau3 is root age."""
+        mu = 4 / 3
+        y = np.array(4 * (1 + mu * 2 * theta) * (self.MOM_mat @ p_hat_Q)).ravel()  # convert 2D matrix to 1D array
+        MOM_tau = -np.log(y ** (1 / (2 * mu)))
+        return MOM_tau
 
 
 ##############################################################################################################
@@ -1528,10 +1601,10 @@ class QuartetFeature:
 
     @property
     def num_retic(self):
-        """Number of reticulations in the quartet subnetwork."""
+        """Number of reticulations in the network."""
         if not self.tree_features:
             return 0
-        return len(self.tree_features[0].gamma_id)
+        return len(self.gamma_id[0])
 
     def get_true_probs(self, net_params: NetworkParameters, alpha: float = 4 / 3):
         """
@@ -1572,6 +1645,22 @@ class QuartetFeature:
 
         return TrueProbs
 
+    def get_MOM_tau(self, p_hat_Q, theta, num_tau):
+        """Computes MOM estimators of [tau1, tau2, tau3, theta] for this quartet subnetwork. tau3 is root age."""
+        tau_sum = np.zeros(num_tau)
+        tau_count = np.zeros(num_tau)
+
+        for qt_feature in self.tree_features:
+            tau_idx = (num_tau - qt_feature.param_idx)[:3]  # convert to 0-based indexing
+            sp_relation = qt_feature.get_site_pattern_relationship(inverse = True)
+            tau_vals = qt_feature.topology.get_MOM_tau(p_hat_Q[sp_relation], theta)
+
+            # Accumulate the reversed values
+            tau_sum[tau_idx] += tau_vals[::-1]
+            tau_count[tau_idx] += 1
+
+        return tau_sum, tau_count
+
 @dataclass
 class PairedQuartetFeature:
     """Encapsulates paired seq_data_rows with quartet features (param_idx, is_asymm, taxa_perm, gamma_id)"""
@@ -1584,7 +1673,6 @@ class PairedQuartetFeature:
         self.quartet_feature.
         """
         return getattr(self.quartet_feature, name)
-
 
 
 ##############################################################
@@ -1604,6 +1692,12 @@ class QuartetData:
     E_mat: np.matrix  # Shape: (15, len(n_D))
     quartet_feature: QuartetFeature
 
+    def __getattr__(self, name: str):
+        """
+        If an attribute or method isn't found on QuartetData, Python automatically redirects the call to
+        self.quartet_feature.
+        """
+        return getattr(self.quartet_feature, name)
 
 
 #################################################################################
@@ -1955,247 +2049,325 @@ def get_network_comp_log_lik(all_quartet_data: list[QuartetData,...],
                               network_parameters: NetworkParameters):
     """Computes species network composite log likelihood."""
     comp_log_lik = 0
-    for qd in all_quartet_data:
-        true_probs = qd.quartet_feature.get_true_probs(network_parameters)
-        comp_log_lik += np.sum(qd.n_Q * np.log(true_probs))
+    for q_data in all_quartet_data:
+        p_Q = q_data.get_true_probs(network_parameters)
+        comp_log_lik += np.sum(q_data.n_Q * np.log(p_Q))
 
     return comp_log_lik
 
+###############################################################################
+## Diagnosing quartet information for computing network composite likelihood ##
+###############################################################################
+
+def printQuartet(all_quartet_data: list[QuartetData,...],
+                  network_parameters: NetworkParameters):
+    """Print all information about every quartet subnetworks for checking errors."""
+    for i, q_data in enumerate(all_quartet_data):
+        p_Q = q_data.get_true_probs(network_parameters)
+        comp_log_lik = np.sum(q_data.n_Q * np.log(p_Q))
+        print(f"""
+Quartet taxa names: {q_data.taxa}, index {i}
+Site pattern counts: {q_data.n_Q}
+Site pattern frequencies: {q_data.n_Q / sum(q_data.n_Q)}
+True Probs: {p_Q}
+Parameter indices: {q_data.param_idx}
+is_asymm: {q_data.is_asymm}
+Sort order: {list(q_data.taxa_perm)}
+Gamma indices: {list(q_data.gamma_id)}
+Quartet likelihood: {comp_log_lik}
+""")
 
 ########################################################
 ## Find MCLE for species network composite likelihood ##
 ########################################################
 
-def parameter_transform(parameters, labeled_network):
-    """Transforms parameters into trans_param according to Kong et al. 2025.
-    If tau_i/tau_A(i) >= 1, we set tau_i/tau_A(i) = 0.999 to guarantee parameters within constraints."""
-    import numpy as np
-    h = len(labeled_network.reticulations)  # Number of hybridization
-    tree_parameters = parameters[:-h]
-    gamma_parameters = parameters[-h:]
-    num_t = len(tree_parameters) - 1
-    trans_gamma = np.arcsin(np.sqrt(gamma_parameters))
-    trans_tree = np.zeros(len(tree_parameters))
-    for k, val in enumerate(tree_parameters):
-        if k == 0 or k == num_t:
-            trans_tree[k] = np.log(val)
-        else:
-            tau_idx = num_t - k
-            node = labeled_network.labels[tau_idx][0]
-            parent = next(labeled_network.predecessors(node))
-            parent_val = tree_parameters[num_t - get_label_from_node(labeled_network, parent)]
-            ratio = min(val / parent_val, 0.999)
-            trans_tree[k] = np.arcsin(np.sqrt(ratio))
-    return np.concatenate((trans_tree, trans_gamma))
 
-def parameter_backtransform(trans_param, labeled_network):
-    """Back-transforms trans_param into parameters according to Kong et al. 2025."""
-    import numpy as np
-    h = len(labeled_network.reticulations)  # Number of hybridization
-    trans_tree = trans_param[:-h]
-    trans_gamma = trans_param[-h:]
-    num_t = len(trans_tree) - 1
-    gamma = np.sin(trans_gamma) ** 2
-    tree = np.zeros(len(trans_tree))
-    for k, tv in enumerate(trans_tree):
-        if k == 0 or k == num_t:
-            tree[k] = np.exp(tv)
-        else:
-            tau_idx = num_t - k
-            node = labeled_network.labels[tau_idx][0]
-            parent = next(labeled_network.predecessors(node))
-            parent_val = tree[num_t - get_label_from_node(labeled_network, parent)]
-            tree[k] = parent_val * np.sin(tv) ** 2
-    return np.concatenate((tree, gamma))
+def log_invgamma(x, alpha, beta):
+    """Computes kernals of log Inverse Gamma distribution with shape alpha and scale beta."""
+    if x <= 0:
+        return -np.inf
+    return -(alpha + 1) * np.log(x) - beta / x
 
+class ParameterTransformer:
+    """Transform and back-transform network parameters for unconstrained optimization. (Kong et al. 2025)."""
 
-def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, is_fixed_param=None,
-                        MultiStart=None, Warning=False):
-    """Get MCLE for self parameters = [tau_1,...,tau_J, theta, gamma_1,...,gamma_h].
-    is_fixed_param decides which parameters are fixed for constrained optimization."""
-    # ---------------------------------------
-    # Imports packages and network informations
-    # ---------------------------------------
-    import numpy as np
-    from scipy.optimize import minimize
-    import warnings
+    def __init__(self, network: "SpeciesNetwork"):
+        self.labeled_network = network.copy()
+        self.labeled_network.label_speciation_time_idx()
 
-    # Get labeled_network
-    labeled_network = phylox_network.copy()
-    label_speciation_time_idx(labeled_network)
+    def parameter_transform(self, params: np.ndarray):
+        """Transforms parameters into trans_param according to Kong et al. 2025.
+        If tau_i/tau_A(i) >= 1, we set tau_i/tau_A(i) = 0.999 to guarantee parameters within constraints."""
+        num_tau = self.labeled_network.num_tau
+        num_retic = self.labeled_network.num_retic
 
-    # Precompute basic network counts once
-    N = len(labeled_network.leaves)  # Number of taxa
-    h = len(labeled_network.reticulations)  # Number of hybridization
-    J = N + h - 1  # Number of speciation times
+        tree_parameters = params[:-num_retic]
+        gamma_parameters = params[-num_retic:] if num_retic > 0 else np.array([])
 
-    # ---------------------------------------
-    # Given theta, get MOM estimators of parameters
-    # ---------------------------------------
-    # 1. Precompute MOM constant matrices ONCE
-    # Symmetric case
-    W_s = np.matrix([
-        [4, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 12, 0, 0, 0, 0, 0, 0, 0],
-        [0, 12, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 12, 0, 0, 0, 0, 0, 0],
-        [0, 0, 12, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 12, 0, 0, 0, 0, 0],
-        [0, 0, 0, 12, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 12, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 24, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 24, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 24]
-    ])
-    Coef_s = np.matrix([
-        [1, -2, 6, -2, 3, -2, 6, -8, -2],
-        [1, 6, -2, -2, 3, 6, -2, -8, -2],
-        [1, 2, 2, 2, -1, -2, -2, 0, -2]
-    ])
-    WS_pinv = np.linalg.inv(W_s.T @ W_s) @ W_s.T  # pseudo-inverse
-    MOM_mat_s = Coef_s @ WS_pinv  # Precompute full transformation matrix
+        trans_gamma = np.arcsin(np.sqrt(gamma_parameters))
+        trans_tree = np.zeros(len(tree_parameters))
+        for k, val in enumerate(tree_parameters):
+            if k == 0 or k == num_tau:
+                trans_tree[k] = np.log(val)
+            else:
+                tau_idx = num_tau - k
+                node = self.labeled_network.labels[tau_idx][0]
+                parent = next(self.labeled_network.predecessors(node))
+                parent_val = tree_parameters[num_tau - self.labeled_network.get_label_from_node(parent)]
+                # noinspection PyTypeChecker
+                ratio = min(val / parent_val, 0.999)
+                trans_tree[k] = np.arcsin(np.sqrt(ratio))
+        return np.concatenate((trans_tree, trans_gamma))
 
-    # Asymmetric case
-    W_a = np.matrix([
-        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
-        [0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]
-    ])
-    Coef_a = np.matrix([
-        [3, -7, 10, 9, -5, 8, -8, 18, -10, -12, -6],
-        [3, 5, -2, 9, 7, -4, -8, -6, -10, 12, -6],
-        [3, 10, 5, -3, 2, 1, 2, -6, 4, -12, -6]
-    ])
-    WA_pinv = np.linalg.inv(W_a.T @ W_a) @ W_a.T
-    MOM_mat_a = Coef_a @ WA_pinv
+    def parameter_backtransform(self, trans_param: np.ndarray):
+        """Back-transforms trans_param into parameters according to Kong et al. 2025."""
+        num_tau = self.labeled_network.num_tau
+        num_retic = self.labeled_network.num_retic
 
-    # Pre-process zipped_data_net so we don't recalculate p_hat_Q during the theta search
-    precomputed_data = []
-    for n_Q, param_idx, is_asymm, taxa_perm, gamma_id in zipped_data_net:
-        precomputed_data.append((n_Q / n_Q.sum(), param_idx, is_asymm, taxa_perm))
+        trans_tree = trans_param[:-num_retic]
+        trans_gamma = trans_param[-num_retic:]
 
-    # 2. Functions to get MOM of tau's
-    mu = 4 / 3
+        gamma = np.sin(trans_gamma) ** 2
+        tree = np.zeros(len(trans_tree))
+        for k, tv in enumerate(trans_tree):
+            if k == 0 or k == num_tau:
+                tree[k] = np.exp(tv)
+            else:
+                tau_idx = num_tau - k
+                node = self.labeled_network.labels[tau_idx][0]
+                parent = next(self.labeled_network.predecessors(node))
+                parent_val = tree[num_tau - self.labeled_network.get_label_from_node(parent)]
+                tree[k] = parent_val * np.sin(tv) ** 2
+        return np.concatenate((tree, gamma))
 
-    def get_MOM_tau_symm(p_hat_Q, theta):
-        "Returns MOM estimators of [tau1, tau2, tau3] of symmetric quartet. tau3 is root age."
-        y = np.array(4 * (1 + mu * 2 * theta) * (MOM_mat_s @ p_hat_Q)).ravel()  # convert 2D matrix to 1D array
-        MOM_tau = -np.log(y ** (1 / (2 * mu)))
-        return MOM_tau
+class MOMEstimator:
+    """Computes Method of Moments (MOM) estimators for species network parameters."""
 
-    def get_MOM_tau_asymm(p_hat_Q, theta):
-        "Returns MOM estimators of [tau1, tau2, tau3] of asymmetric quartet. tau3 is root age."
-        y = np.array((4 / 3) * (1 + mu * 2 * theta) * (MOM_mat_a @ p_hat_Q)).ravel()
-        MOM_tau = -np.log(y ** (1 / (2 * mu)))
-        return MOM_tau
+    def __init__(self, network: "SpeciesNetwork", all_quartet_data: list[QuartetData,...]):
+        self.network = network
+        self.num_tau = network.num_tau
+        self.all_quartet_data = all_quartet_data
 
-    # 3. Get parameters
-    def get_MOM_tree_param(theta):
-        tau_sum = np.zeros(J)
-        tau_count = np.zeros(J)
+    def get_MOM_tree_param(self,theta):
+        num_tau = self.num_tau
+        tau_sum = np.zeros(num_tau)
+        tau_count = np.zeros(num_tau)
 
-        for p_hat_Q, param_idx, is_asymm, taxa_perm in precomputed_data:
-            for pi, ia, tp in zip(param_idx, is_asymm, taxa_perm):
-                tau_idx = (J - pi)[:3]  # convert to 0-based indexing
-                SP_relation = get_site_pattern_relationship(np.argsort(tp))
-                tau_vals = (get_MOM_tau_asymm if ia else get_MOM_tau_symm)(p_hat_Q[SP_relation], theta)
-
-                # Accumulate the reversed values
-                tau_sum[tau_idx] += tau_vals[::-1]
-                tau_count[tau_idx] += 1
+        for q_data in self.all_quartet_data:
+            p_hat_Q = q_data.n_Q / q_data.n_Q.sum()
+            t_sum, t_count = q_data.get_MOM_tau(p_hat_Q, theta, num_tau)
+            tau_sum += t_sum
+            tau_count += t_count
 
         tau_est = tau_sum / tau_count
         return np.append(tau_est, theta)
 
-    # ---------------------------------------
-    # Theta bound search for optimization
-    # ---------------------------------------
-    _, _, tau_in_constraints = get_tau_prior_and_constraint(phylox_network)
+class TauPriorTauConstraint:
+    """
+    Analyzes network topology to enforce ancestor-descendant speciation time constraints (tau)
+    and compute joint log-priors and valid proposal boundaries for MCMC/Optimization routines.
+    """
 
-    def get_feasible_theta_bound(gamma_parameters):
-        def f_star_func(theta, gamma_parameters):
-            """Composite likelihood wrapper given only theta as input parameter."""
-            raw_tree_param = get_MOM_tree_param(theta)
-            if np.any(raw_tree_param < 0) or not tau_in_constraints(raw_tree_param[:-1]):
-                return np.inf
-            raw_param = np.concatenate((raw_tree_param, gamma_parameters))
-            try:
-                return -get_network_comp_log_lik(zipped_data_net, raw_param)
-            except:
-                return np.inf
+    def __init__(self, network: SpeciesNetwork):
+        # Work on a ladderized copy to simplify asymmetric pattern recognition
+        self.labeled_network = network.copy()
+        self.labeled_network.label_speciation_time_idx()
+        self.labeled_network.ladderize(ascending=False)
 
-        # Golden section search
-        a = 1e-5
-        b = 1e-4
-        while np.all(get_MOM_tree_param(b) > 0):
-            b *= 10
+        self.num_tau = self.labeled_network.num_tau
 
-        golden = 2 / (np.sqrt(5) + 1)
-        t1 = b - golden * (b - a)
-        t2 = a + golden * (b - a)
-        f1 = f_star_func(t1, gamma_parameters)
-        f2 = f_star_func(t2, gamma_parameters)
+        # Precompute parent-child index pairs for tau topological constraints
+        self.p_idx, self.c_idx = self._precompute_tau_constraint_idx()
+        # Precompute indexing vectors (tau_pr_idx) and prior weights (tau_pr_pwr)
+        self.tau_pr_idx, self.tau_pr_pwr = self._precompute_tau_prior_idx_pwr()
 
-        while b - a > .01:
-            if f2 > f1 or f2 == np.inf:
-                b, t2, f2 = t2, t1, f1
-                t1 = b - golden * (b - a)
-                f1 = f_star_func(t1, gamma_parameters)
+    def _precompute_tau_constraint_idx(self):
+        """Precomputes constraint index vectors (p_idx ancestral to c_idx) for tau array validation."""
+        # Get the constraints of tau as a list of pairs
+        constraints = []
+        for node in self.labeled_network.internal_nodes:
+            parent = next(self.labeled_network.predecessors(node), None)
+            if parent is not None:
+                parent_label = self.labeled_network.get_label_from_node(parent)
+                child_label = self.labeled_network.get_label_from_node(node)
+                constraints.append([parent_label, child_label])
+
+        # Extract the parent and child columns as separate 1D arrays
+        if constraints:
+            # Adjust for 0-based array indexing: index = num_tau - label
+            p_idx = self.num_tau - np.array(constraints[:, 0])
+            c_idx = self.num_tau - np.array(constraints[:, 1])
+            return p_idx, c_idx
+
+        return np.array([], dtype=int), np.array([], dtype=int)
+
+    def tau_in_constraints(self, tau: np.ndarray):
+        """Checks whether all speciation times satisfy topological tau_parent > tau_child constraints."""
+        if self.p_idx.size == 0:
+            return True
+        return bool(np.all(tau[self.p_idx] > tau[self.c_idx]))
+
+    def _precompute_tau_prior_idx_pwr(self):
+        """Precomputes constraint index pairs and prior exponents based on network preorder traversal."""
+        net = self.labeled_network
+        leaves = set(net.leaves)
+        internal_nodes = net.internal_nodes
+
+        tau_prior_idx = []
+        tau_prior_pwr = []
+        asymm_pattern_count = 0
+
+        # Preorder traversal across internal nodes
+        for node in internal_nodes:
+            # Skip internal node if both child nodes are leaves
+            if sum(child in leaves for child in net.successors(node)) == 2:
+                if asymm_pattern_count > 0:
+                    tau_prior_pwr.append(-asymm_pattern_count)
+                    asymm_pattern_count = 0
+                continue
+
+            # Check if at least one child node is a leaf
+            any_leaf_child = any(child in leaves for child in net.successors(node))
+
+            if any_leaf_child:
+                # Start of an asymmetric subtree pattern
+                if asymm_pattern_count == 0:
+                    tau_prior_idx.append(net.get_label_from_node(node))
+                asymm_pattern_count += 1
             else:
-                a, t1, f1 = t1, t2, f2
-                t2 = a + golden * (b - a)
-                f2 = f_star_func(t2, gamma_parameters)
+                # Symmetric subtree pattern
+                if asymm_pattern_count > 0:
+                    tau_prior_pwr.append(-asymm_pattern_count)
+                    asymm_pattern_count = 0
+                tau_prior_idx.append(net.get_label_from_node(node))
+                tau_prior_pwr.append(-2)
 
-        return [a, b]
+        if asymm_pattern_count > 0:
+            tau_prior_pwr.append(-asymm_pattern_count)
 
-    # ---------------------------------------
-    # Expand compressed vector after constrained optimization
-    # ---------------------------------------
-    def expand_trans_param(comp, mask):
-        """Expand compressed vector after constrained optimization"""
-        out = np.zeros(len(mask))
-        out[~mask] = comp
+        # Adjust for 0-based array indexing: index = num_tau - label
+        tau_prior_idx_adj = self.num_tau - np.array(tau_prior_idx, dtype=int)
+
+        return tau_prior_idx_adj, np.array(tau_prior_pwr, dtype=float)
+
+    def log_prior_tau(self, tau: np.ndarray, ig_alpha: float = 3.0, ig_beta: float = 0.002):
+        """
+        Computes the joint log-prior density for speciation time parameters' tau.
+        Root age (tau[0]) uses an Inverse-Gamma prior, while internal speciation
+        times use uniform kernel powers based on network topology.
+        """
+        if not self.tau_in_constraints(tau):
+            return -np.inf
+
+        # Root age prior (Inverse Gamma)
+        root_log_prior = log_invgamma(tau[0], ig_alpha, ig_beta)
+
+        # Internal node priors (Uniform)
+        internal_log_prior = np.sum(self.tau_pr_pwr * np.log(tau[self.tau_pr_idx]))
+
+        return root_log_prior + internal_log_prior
+
+    def get_tau_boundaries(self, current_tau: np.ndarray) -> np.ndarray:
+        """
+        Calculates the feasible lower and upper boundary interval [lwr_b, upr_b]
+        for each tau parameter given the current state of tau.
+        """
+        lwr_b = np.zeros(self.num_tau, dtype=float)         # Default lower bound is 0
+        upr_b = np.full(self.num_tau, np.inf, dtype=float)  # Default upper bound is inf
+
+        if self.p_idx.size > 0:
+            # Vectorized in-place update of bounds
+            np.maximum.at(lwr_b, self.p_idx, current_tau[self.c_idx])
+            np.minimum.at(upr_b, self.c_idx, current_tau[self.p_idx])
+
+        return np.column_stack((lwr_b, upr_b))
+
+class Optimizer:
+    """Finds maximum composite likelihood estimator (MCLE) of network composite likelihood"""
+
+    def __init__(self, network: SpeciesNetwork,
+                 all_quartet_data: list[QuartetData,...]):
+        self.network = network
+        self.all_quartet_data = all_quartet_data
+        # Labeled network copy for parameter index lookup
+        self.labeled_network = network.copy()
+        self.labeled_network.label_speciation_time_idx()
+        # Associated helper instances
+        self.transformer = ParameterTransformer(self.network)
+        self.mom_estim = MOMEstimator(self.network, self.all_quartet_data)
+        self.tau_constraint = TauPriorTauConstraint(self.network)
+        # Basic dimensions
+        self.num_retic = self.network.num_retic
+        self.num_tau = self.network.num_tau
+        self.total_params = self.num_tau + 1 + self.num_retic  # tau's + theta + gamma's
+
+
+    @staticmethod
+    def expand_trans_param(compressed_vec: np.ndarray, is_fixed_param: np.ndarray):
+        """Expands compressed active parameter vector into full length according to fixed parameter mask."""
+        out = np.zeros(len(is_fixed_param))
+        out[~is_fixed_param] = compressed_vec
         return out
 
-    # ---------------------------------------
-    # Negative log composite likelihood for optimizer
-    # ---------------------------------------
-    def neg_log_lik(x):
+    def get_feasible_theta_bound(self, initial_gamma: np.ndarray):
+        """Golden-section search to find a feasible theta range where MOM tree parameters are valid."""
+
+        def f_star(theta: float):
+            raw_tree_param = self.mom_estim.get_MOM_tree_param(theta)
+            if np.any(raw_tree_param < 0) or not self.tau_constraint.tau_in_constraints(raw_tree_param[:-1]):
+                return np.inf
+            net_params = NetworkParameters.from_vectors(raw_tree_param, initial_gamma)
+            try:
+                return -get_network_comp_log_lik(self.all_quartet_data, net_params)
+            except Exception:
+                return np.inf
+
+        lb, ub = 1e-5, 1e-4
+        while np.all(self.mom_estim.get_MOM_tree_param(ub) > 0):
+            ub *= 10.0
+
+        golden = 2 / (np.sqrt(5) + 1)
+        t1 = ub - golden * (ub - lb)
+        t2 = lb + golden * (ub - lb)
+        f1, f2 = f_star(t1), f_star(t2)
+
+        while (ub - lb) > 0.01:
+            if f2 > f1 or np.isinf(f2):
+                ub, t2, f2 = t2, t1, f1
+                t1 = ub - golden * (ub - lb)
+                f1 = f_star(t1)
+            else:
+                lb, t1, f1 = t1, t2, f2
+                t2 = lb + golden * (ub - lb)
+                f2 = f_star(t2)
+
+        return [lb, ub]
+
+    def _neg_log_lik(self, x: np.ndarray, is_fixed_param: np.ndarray) -> float:
+        """Objective function evaluating negative composite log-likelihood."""
         if not np.all(np.isfinite(x)):
             return np.inf
 
-        trans_param = expand_trans_param(x, is_fixed_param)
-        params = parameter_backtransform(trans_param, labeled_network)
+        full_trans = self.expand_trans_param(x, is_fixed_param)
+        raw_params = self.transformer.parameter_backtransform(full_trans)
 
-        if not np.all(np.isfinite(params)) or np.any(params < 0):
+        if not np.all(np.isfinite(raw_params)) or np.any(raw_params < 0):
             return np.inf
 
+        tree_vec = raw_params[:-self.num_retic]
+        gamma_vec = raw_params[-self.num_retic:] if self.num_retic > 0 else np.array([])
+        net_params = NetworkParameters.from_vectors(tree_vec, gamma_vec)
+
         try:
-            return -get_network_comp_log_lik(zipped_data_net, params)
+            return -get_network_comp_log_lik(self.all_quartet_data, net_params)
         except FloatingPointError:
             print("Floating point error at x =", x)
             raise
 
-    # ---------------------------------------
-    # Generate 10 Random Valid Starting Points
-    # ---------------------------------------
-    def get_random_starts(fixed_gammas, num_starts):
+    def _get_random_starts(self, fixed_gammas: np.ndarray | None,
+                           is_fixed_param: np.ndarray,
+                           num_starts: int):
+        """Generates random initial active parameter vectors for multi-start optimization."""
         starts = []
         attempts = 0
 
@@ -2203,60 +2375,58 @@ def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, 
             attempts += 1
             # 1. Randomize theta (log-uniform to safely cover magnitudes from 1e-5 to 0.1)
             rand_theta = np.exp(np.random.uniform(np.log(1e-5), np.log(0.1)))
-            raw_tree_param = get_MOM_tree_param(rand_theta)
+            raw_tree_param = self.mom_estim.get_MOM_tree_param(rand_theta)
 
             # 2. Randomize Gammas (or use fixed ones if constrained)
-            if fixed_gammas is not None:
+            if fixed_gammas is not None and len(fixed_gammas) > 0:
                 current_gamma = fixed_gammas.copy()
             else:
-                current_gamma = np.random.uniform(0.1, 0.9, size=h)
+                current_gamma = np.random.uniform(0.1, 0.9, size=self.num_retic)
 
             raw_param = np.concatenate((raw_tree_param, current_gamma))
 
             # 3. Transform to unconstrained space
             try:
-                trans_param = parameter_transform(raw_param, labeled_network)
+                trans_param = self.transformer.parameter_transform(raw_param)
             except Exception:
                 continue
 
-            # 4. Add "jitter" (Gaussian noise) to spread starting points across the surface
-            jitter = np.random.normal(0, 0.5, size=J)
-            trans_param[:J] += jitter
+            # 4. Add "jitter" (Gaussian noise) to starting points of tau's
+            jitter = np.random.normal(0, 0.5, size=self.num_tau)
+            trans_param[:self.num_tau] += jitter
             x0 = trans_param[~is_fixed_param]
 
             # 5. Verify it evaluates to a finite likelihood
-            if np.isfinite(neg_log_lik(x0)):
+            if np.isfinite(self._neg_log_lik(x0, is_fixed_param)):
                 starts.append(x0)
 
         # Fallback: if constraints are incredibly tight, inject completely random vectors
         while len(starts) < num_starts:
             x0 = np.random.normal(0, 1.0, size=np.sum(~is_fixed_param))
-            if np.isfinite(neg_log_lik(x0)):
+            if np.isfinite(self._neg_log_lik(x0, is_fixed_param)):
                 starts.append(x0)
 
         return starts
 
-    # ---------------------------------------
-    # Multi-start BFGS Optimization Runner
-    # ---------------------------------------
-    def run_multistart_optimization(gamma_parameters, num_starts):
-        if isinstance(num_starts, bool) or not isinstance(num_starts, (int, float, np.number)):
-            num_starts = 10
-
-        valid_starts = get_random_starts(gamma_parameters, num_starts)
+    def _run_multi_start_optimization(self, initial_gamma: np.ndarray | None,
+                                      is_fixed_param: np.ndarray,
+                                      num_starts: int,
+                                      warning: bool = False):
+        """Runs multi-start BFGS optimization across multiple random starting points."""
+        valid_starts = self._get_random_starts(initial_gamma, is_fixed_param, num_starts)
 
         best_res = None
         best_lik = np.inf
 
-        for i, x0 in enumerate(valid_starts):
+        for x0 in valid_starts:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
-
                 # Pass 1: Get into the immediate neighborhood
-                res1 = minimize(neg_log_lik, x0, method="BFGS", options=dict(gtol=1e-5, maxiter=5000))
-
+                res1 = minimize(self._neg_log_lik, x0, args=(is_fixed_param,), method="BFGS",
+                                options=dict(gtol=1e-5, maxiter=5000))
                 # Pass 2: "Polish" run to cleanly snap to the peak
-                res2 = minimize(neg_log_lik, res1.x, method="BFGS", options=dict(gtol=1e-7, maxiter=10000))
+                res2 = minimize(self._neg_log_lik, res1.x, args=(is_fixed_param,), method="BFGS",
+                                options=dict(gtol=1e-7, maxiter=10000))
 
                 # Keep track of the lowest negative log-likelihood found
                 if np.isfinite(res2.fun) and res2.fun < best_lik:
@@ -2264,116 +2434,108 @@ def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, 
                     best_res = res2
 
         if best_res is None:
-            raise RuntimeError("All unconstrained multi-start optimization attempts failed.")
+            raise RuntimeError("All multi-start optimization attempts failed.")
 
-        if Warning and not best_res.success:
-            print(f"Warning: Best optimizer run did not fully converge. Message: {best_res.message}")
+        if warning and not best_res.success:
+            warnings.warn(f"Best multi-start optimizer run did not fully converge: {best_res.message}")
 
         return best_res
 
-    # ---------------------------------------
-    # Fixed-start BFGS Optimization Runner
-    # ---------------------------------------
-    def run_fixstart_optimization(gamma_parameters, current_is_fixed_param):
-        """Run the core optimization steps for a given set of gamma parameters."""
-        # Step 1: Get theta bound and initial point of parameters
-        theta_bound = get_feasible_theta_bound(gamma_parameters)
-        initial_theta = np.mean(theta_bound)
-        initial_tree_param = get_MOM_tree_param(initial_theta)
-        initial_trans_param = parameter_transform(np.concatenate((initial_tree_param, gamma_parameters)),
-                                                  labeled_network)
+    def _run_fix_start_optimization(self, initial_gamma: np.ndarray,
+                                    is_fixed_param: np.ndarray,
+                                    warning: bool = False):
+        """Run two-pass BFGS optimization from MOM-derived initial tree parameters for a given initial gamma parameters."""
+        # Step 1: Get theta bound and initial parameters
+        theta_bound = self.get_feasible_theta_bound(initial_gamma)
+        initial_theta = float(np.mean(theta_bound))
+        initial_tree_param = self.mom_estim.get_MOM_tree_param(initial_theta)
+
+        initial_net_param = np.concatenate((initial_tree_param, initial_gamma))
+        initial_trans_param = self.transformer.parameter_transform(initial_net_param)
 
         # Step 2: Constrained optimization using BFGS method
-        x0 = initial_trans_param[~current_is_fixed_param]
+        x0 = initial_trans_param[~is_fixed_param]
 
-        # Pass 1
-        res1 = minimize(neg_log_lik, x0, method="BFGS",
+        # Pass 1: Global convergence
+        res1 = minimize(self._neg_log_lik, x0, args=(is_fixed_param,), method="BFGS",
                         options=dict(gtol=1e-5, maxiter=5000))
 
-        # Pass 2: "Polish" run.
-        res2 = minimize(neg_log_lik, res1.x, method="BFGS",
+        # Pass 2: Fine polishing
+        res2 = minimize(self._neg_log_lik, res1.x, args=(is_fixed_param,), method="BFGS",
                         options=dict(gtol=1e-7, maxiter=10000))
 
-        if not res2.success and Warning:
-            print(f"Warning: Optimizer did not fully converge! Message: {res2.message}")
+        if warning and not res2.success:
+            warnings.warn(f"Optimizer did not fully converge! Message: {res2.message}")
             if hasattr(res2, 'jac'):
                 print(f"Max gradient remaining: {np.max(np.abs(res2.jac))}")
 
         return res2
 
-    # ---------------------------------------
-    # Setup Optimization Constraints & Execute
-    # ---------------------------------------
-    if is_fixed_param is not None:
-        # --- CONSTRAINED OPTIMIZATION ---
-        gamma_parameters = np.where(is_fixed_param[-h:], 0, 0.5)
+    def get_MCLE_parameters(self, initial_gamma: np.ndarray | None = None,
+                            is_fixed_param: np.ndarray | None = None,
+                            multi_start: int | bool | None = None,
+                            warning: bool = False) -> tuple[NetworkParameters, float]:
+        """
+        Get MCLE for network parameters = [tau_1,...,tau_J, theta, gamma_1,...,gamma_h].
+        'is_fixed_param' decides which parameters are fixed for constrained optimization.
+        Returns (mcle_net_params, max_comp_log_lik)
+        """
+        h = self.num_retic
 
-        if not (MultiStart is None or MultiStart is False):
-            result = run_multistart_optimization(gamma_parameters, MultiStart)
+        if is_fixed_param is not None:
+            # --- CONSTRAINED OPTIMIZATION ---
+            if initial_gamma is None:
+                initial_gamma = np.where(is_fixed_param[-h:] if h > 0 else np.array([]), 0.0, 0.5)
+
+            if multi_start: # Run multiple start-points optimization
+                n_starts = 10 if isinstance(multi_start, bool) else int(multi_start)
+                result = self._run_multi_start_optimization(initial_gamma, is_fixed_param, n_starts, warning)
+            else:           # Run fixed start-point optimization
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always", RuntimeWarning)
+                    result = self._run_fix_start_optimization(initial_gamma, is_fixed_param, warning)
+                if any(issubclass(wi.category, RuntimeWarning) for wi in w) and warning:
+                    print("Constrained optimization produced RuntimeWarning(s); results may be unstable.")
+
         else:
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always", RuntimeWarning)
-                result = run_fixstart_optimization(gamma_parameters, is_fixed_param)
+            # --- UNCONSTRAINED OPTIMIZATION ---
+            is_fixed_param = np.full(self.total_params, False)
 
-            if any(issubclass(wi.category, RuntimeWarning) for wi in w):
-                print("Constrained optimization produced RuntimeWarning(s); results may be unstable.")
-
-    else:
-        # --- UNCONSTRAINED OPTIMIZATION ---
-        is_fixed_param = np.full(J + 1 + h, False)
-
-        if not (MultiStart is None or MultiStart is False):
-            result = run_multistart_optimization(gamma_parameters, MultiStart)
-        else:
-            if gamma_parameters is not None:
-                result = run_fixstart_optimization(gamma_parameters, is_fixed_param)
-            else:
-                # Allow multiple retry gammas to get minimize()
-                gamma_try = [0.5, 0.45, 0.4, 0.35, 0.3, 0.25]
-                for g in gamma_try:
-                    current_gamma = np.where(is_fixed_param[-h:], 0, g)
-                    try:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("error", RuntimeWarning)
-                            result = run_fixstart_optimization(current_gamma, is_fixed_param)
-                        break  # If we reached here, optimization succeeded
-                    except RuntimeWarning:
-                        print(f"Unconstrained optimization failed due to numerical instability (gamma = {g})")
+            if multi_start: # Run multiple start-points optimization
+                n_starts = 10 if isinstance(multi_start, bool) else int(multi_start)
+                result = self._run_multi_start_optimization(initial_gamma, is_fixed_param, n_starts, warning)
+            else:           # Run fixed start-point optimization
+                if initial_gamma is not None:
+                    result = self._run_fix_start_optimization(initial_gamma, is_fixed_param, warning)
                 else:
-                    raise RuntimeError("All unconstrained optimization attempts failed due to numerical issues.")
+                    # Allow multiple retry gammas to get minimize()
+                    gamma_try = [0.5, 0.45, 0.4, 0.35, 0.3, 0.25]
+                    for g in gamma_try:
+                        current_gamma = np.full(h, g)
+                        try:
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("error", RuntimeWarning)
+                                result = self._run_fix_start_optimization(current_gamma, is_fixed_param, warning)
+                            break   # If we reached here, optimization succeeded
+                        except RuntimeWarning:
+                            if warning:
+                                print(f"Unconstrained optimization retry with gamma = {g}")
+                    else:
+                        raise RuntimeError("All unconstrained optimization attempts failed due to numerical issues.")
 
-    # 4. Export optimized estimators and back-transform them
-    trans_estimator = result.x
-    comp_loglik = -result.fun
-    full_trans = expand_trans_param(trans_estimator, is_fixed_param)
-    estimator = parameter_backtransform(full_trans, labeled_network)
+        # Reconstruct output as NetworkParameters dataclass instance
+        trans_estimator = result.x
+        max_comp_log_lik = -result.fun
+        full_trans = self.expand_trans_param(trans_estimator, is_fixed_param)
+        raw_estimator = self.transformer.parameter_backtransform(full_trans)
 
-    return estimator, comp_loglik
+        tree_vec = raw_estimator[:-self.num_retic]
+        gamma_vec = raw_estimator[-self.num_retic:] if self.num_retic > 0 else np.array([])
+        mcle_net_params = NetworkParameters.from_vectors(tree_vec, gamma_vec)
 
-###############################################################################
-## Diagnosing quartet information for computing network composite likelihood ##
-###############################################################################
+        return mcle_net_params, max_comp_log_lik
 
-def printQuartet(zipped_data_net, phylox_network, parameters):
-    """Print all informations about every quartet subnetworks for checking errors."""
-    from itertools import combinations
 
-    # Get all taxa_labels
-    all_taxa_labels = combinations([str(label) for label in get_taxa_labels(phylox_network)], 4)
-
-    for taxa_labels, (n_Q, param_idx, is_asymm, taxa_perm, gamma_id) in zip(all_taxa_labels, zipped_data_net):
-        p_Q = getTrueProbsQuartet(parameters, param_idx, is_asymm, taxa_perm, gamma_id)
-        CompLogLik = np.sum(n_Q * np.log(p_Q))
-        print(f"""
-Quartet taxa names: {taxa_labels}
-Site pattern counts: {n_Q}
-Site pattern frequencies: {n_Q / sum(n_Q)}
-True Probs: {p_Q}
-Parameter indices: {list(param_idx)}
-is_asymm: {is_asymm}
-Sort order: {list(taxa_perm)}
-Gamma indices: {list(gamma_id)}
-Quartet likelihood: {CompLogLik}""")
 
 
 ###########################################################################################

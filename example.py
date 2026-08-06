@@ -1,6 +1,9 @@
 import dendropy
 from phylox import DiNetwork
-from Network_functions_v02 import SpeciesNetwork, NetworkParameters, SitePatternCounter, get_network_comp_log_lik
+from Network_functions_v02 import (SpeciesNetwork, NetworkParameters, SitePatternCounter, get_network_comp_log_lik,
+                                   printQuartet)
+import numpy as np
+np.set_printoptions(suppress=True, linewidth=np.nan)
 
 network_string = "((((A,B),(C,D)),(E,F#H1)),(#H1,(((G,H),I#H2),(#H2,J))));"
 major_tree_string = "((((A,B),(C,D)),E),(F,((I,J),(G,H))));"
@@ -21,3 +24,4 @@ net_params = NetworkParameters.from_vectors([0.03010305, 0.01985305, 0.01494486,
 
 
 get_network_comp_log_lik(all_quartet_data, net_params)
+
