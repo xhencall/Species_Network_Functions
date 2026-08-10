@@ -9,7 +9,7 @@ import numpy as np
 ###############################
 ## Import required packages  ##
 ###############################
-import re, phylox, dendropy, itertools, warnings
+import copy, re, phylox, dendropy, itertools, warnings
 import networkx as nx
 from abc import ABC, abstractmethod
 from phylox.constants import LABEL_ATTR
@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from itertools import combinations, product
 from collections import Counter, defaultdict
 from scipy.optimize import minimize
+
 
 ##############################################################
 ## Graphical illustration of relationships between classes  ##
@@ -341,7 +342,7 @@ class SpeciesNetwork:
         need_remove = self.get_need_remove_nodes(leaf_node)
         self.remove_nodes_from(need_remove)
 
-    def get_quartet_with_taxa_labels(self, taxa_labels: list[str]) -> "SpeciesNetwork":
+    def get_quartet_with_taxa_labels(self, taxa_labels: list[str]):
         """
         Using PhyloX features to find a subtree containing only taxa_labels.
         """
@@ -833,16 +834,16 @@ class TreeParameters:
         result[:-1] *= self.theta
         return result
 
-    def get_tau_theta(self, tau_idx: list[int]):
+    def get_tau_theta(self, param_idx: list[int]):
         """
         parameters = (tau_J,...,tau_2,tau_1,theta) where tau_J is root age.
-        tau_idx are the speciation time indices of tau (1-based).
+        param_idx are the speciation time indices of tau (1-based).
         Function returns [tau_i1, tau_i2, tau_i3, theta] in reversed order.
         """
-        tau_idx_0base = self.num_tau - np.array(tau_idx)  # adjust for 0-based indexing of tau
+        param_idx_0base = self.num_tau - np.array(param_idx)  # adjust for 0-based indexing of tau
 
         # Output in tau1, tau2, tau3 for convenience to input in getTrueProbs functions.
-        return [self.tau[i] for i in tau_idx_0base[::-1]] + [self.theta]
+        return [self.tau[i] for i in param_idx_0base[::-1]] + [self.theta]
 
 @dataclass
 class GammaParameters:
@@ -965,6 +966,7 @@ class NetworkParameters:
         self.gamma_values = gamma_params.values
         self.num_tau = self.tree.num_tau
         self.num_retic = self.gamma.num_retic
+        self.total_params = self.num_tau + 1 + self.num_retic
 
     @classmethod
     def from_vectors(cls, tree_vec, gamma_vec):
@@ -972,6 +974,16 @@ class NetworkParameters:
         return cls(
             tree_params=TreeParameters(values=np.asarray(tree_vec)),
             gamma_params=GammaParameters(values=np.asarray(gamma_vec))
+        )
+
+    def __repr__(self) -> str:
+        """Controls how the object is displayed when evaluated in REPL / Jupyter."""
+        return (
+            f"NetworkParameters(\n"
+            f"  tau={np.round(self.tree.tau, 6)},\n"
+            f"  theta={self.tree.theta:.6f},\n"
+            f"  gamma={np.round(self.gamma.values, 6)}\n"
+            f")"
         )
 
 
@@ -990,6 +1002,16 @@ class QuartetTreeTopology(ABC):
     @abstractmethod
     def get_MOM_tau(self, p_hat_Q, theta):
         """Computes MOM estimators of [tau1, tau2, tau3] for this quartet subtree. tau3 is root age."""
+        pass
+
+    @abstractmethod
+    def Qt_1st_2nd_deriv(self, network_parameters: NetworkParameters,
+                               quartet_tree_feature: "QuartetTreeFeature"):
+        """
+        For Q_t with len(gamma_id) = r, the length of parameters for this Q_t is 3 + 1 + r (tau's + theta + gamma's).
+        Get the first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}], and
+        get the second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}].
+        """
         pass
 
 class AsymmQuartet(QuartetTreeTopology):
@@ -1237,12 +1259,366 @@ class AsymmQuartet(QuartetTreeTopology):
         WA_pinv = np.linalg.inv(W_a.T @ W_a) @ W_a.T  # pseudo-inverse
         return Coef_a @ WA_pinv  # Precompute full transformation matrix
 
-    def get_MOM_tau(self, p_hat_Q, theta):
+    def get_MOM_tau(self, p_hat_Q: np.ndarray, theta: float):
         """Returns MOM estimators of [tau1, tau2, tau3] of asymmetric quartet. tau3 is root age."""
         mu = 4 / 3
         y = np.array((4 / 3) * (1 + mu * 2 * theta) * (self.MOM_mat @ p_hat_Q)).ravel()
         MOM_tau = -np.log(y ** (1 / (2 * mu)))
         return MOM_tau
+
+    # noinspection PyTypeChecker
+    def Qt_1st_2nd_deriv(self, network_parameters: NetworkParameters,
+                               quartet_tree_feature: "QuartetTreeFeature"):
+        """
+        For Q_t with len(gamma_id) = r, the length of parameters for this Q_t is 3 + 1 + r (tau's + theta + gamma's).
+        Get the first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}], and
+        get the second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric.
+        """
+        # Prepare quartet parameters used to compute site pattern probabilities
+        t1, t2, t3, theta_tilde = network_parameters.tree.get_tau_theta(quartet_tree_feature.param_idx)
+        t = 2 * theta_tilde  # 2*theta.tilde
+        m = 4 / 3  # mu for JC69
+
+        # 15-categ TrueProbs of quartet Q_t pulled from D_t
+        p_Qt = np.matrix(quartet_tree_feature.topology.get_true_probs(t1, t2, t3, theta_tilde, m)).T
+        # get gamma weight for Q_t (Gamma_t)
+        Gamma_t = network_parameters.gamma.get_gamma_weight(quartet_tree_feature.gamma_id)
+        # Get 15 category permutation matrix (Ω_t)
+        Omega = quartet_tree_feature.get_site_pattern_map_matrix()
+
+        # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric and
+        # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
+        # We need: 1) beta vector, 2) W_s weight matrix, 3) C coefficient matrix, 4) dC/d(theta) 1st order derivative of
+        # the C coefficient matrix w.r.t. theta, 5) DC/D(theta) 2nd order derivative the C coefficient matrix w.r.t. theta
+
+        # 1) beta vector
+        beta = np.array([1, np.exp(-2 * m * t1), np.exp(-2 * m * t2), np.exp(-m * t1 - 2 * m * t2), np.exp(-2 * m * t3),
+                         np.exp(-m * t1 - 2 * m * t3),
+                         np.exp(-2 * m * t1 - 2 * m * t3), np.exp(-m * t2 - 2 * m * t3),
+                         np.exp(-m * t1 - m * t2 - 2 * m * t3), np.exp((t1 - t2) * 2 / t - 2 * m * (t2 + t3))])
+
+        # 2) W_a weight matrix
+        W_a = np.matrix([[4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]])
+
+        # 3) C coefficient matrix
+        C = np.matrix(np.zeros((10, 11)))
+        # Row 0 (R's row 1)
+        C[0, :] = 1 / 256
+        # Row 1 (R's row 2)
+        C[1, [0, 2, 3, 4, 7]] = 3 / (256 * (1 + m * t))
+        C[1, [1, 5, 6, 8, 9, 10]] = -1 / (256 * (1 + m * t))
+        # Row 2 (R's row 3)
+        C[2, [0, 3]] = 6 / (256 * (1 + m * t))
+        C[2, [1, 5, 9]] = 2 / (256 * (1 + m * t))
+        C[2, [2, 4, 6, 7, 8, 10]] = -2 / (256 * (1 + m * t))
+        # Row 3 (R's row 4)
+        C[3, [0, 3]] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        C[3, [1, 2, 4, 5, 7, 9]] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        C[3, [6, 8, 10]] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        # Row 4 (R's row 5)
+        C[4, 0] = 9 / (256 * (1 + m * t))
+        C[4, [1, 2]] = 5 / (256 * (1 + m * t))
+        C[4, [3, 7, 9, 10]] = -3 / (256 * (1 + m * t))
+        C[4, [4, 5, 6, 8]] = 1 / (256 * (1 + m * t))
+        # Row 5 (R's row 6)
+        C[5, [0, 2]] = 12 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, [1, 3, 4, 5, 7, 8]] = -4 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, [6, 9, 10]] = 4 / (256 * (1 + m * t) * (2 + m * t))
+        # Row 6 (R's row 7)
+        C[6, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
+        C[6, [1, 2, 3, 6, 7]] = -3 / (256 * (1 + m * t) ** 2)
+        C[6, [5, 8, 9, 10]] = 1 / (256 * (1 + m * t) ** 2)
+        # Row 7 (R's row 8)
+        C[7, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        C[7, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[7, [2, 3, 4, 5, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        C[7, [7, 10]] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[7, [8, 9]] = 0
+        # Row 8 (R's row 9)
+        C[8, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[8, [1, 2, 3, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[8, [5, 6, 7]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[8, [8, 9]] = 0
+        C[8, 10] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        # Row 9 (R's row 10)
+        C[9, 0] = (6 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (
+                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, [1, 2, 3]] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (
+                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, 4] = (2 * m * t * (4 + m * t) ** 2) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, 5] = m * t * (2 * 16 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (
+                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, [6, 7]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, [8, 9]] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (
+                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+        C[9, 10] = 2 * (m ** 3) * (t ** 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
+
+        # 4) dC/d(theta)
+        mt = m * t  # for ease of notation
+        dC_dt = np.matrix(np.zeros((10, 11)))
+        # Row 0 (R's row 1)
+        dC_dt[0, :] = 0
+        # Row 1 (R's row 2)
+        dC_dt[1, [0, 2, 3, 4, 7]] = -3 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[1, [1, 5, 6, 8, 9, 10]] = m / (256 * (1 + m * t) ** 2)
+        # Row 2 (R's row 3)
+        dC_dt[2, [0, 3]] = -6 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[2, [1, 5, 9]] = -2 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[2, [2, 4, 6, 7, 8, 10]] = 2 * m / (256 * (1 + m * t) ** 2)
+        # Row 3 (R's row 4)
+        dC_dt[3, [0, 3]] = -12 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[3, [1, 2, 4, 5, 7, 9]] = 4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[3, [6, 8, 10]] = -4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        # Row 4 (R's row 5)
+        dC_dt[4, 0] = -9 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, [1, 2]] = -5 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, [3, 7, 9, 10]] = 3 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, [4, 5, 6, 8]] = -1 * m / (256 * (1 + m * t) ** 2)
+        # Row 5 (R's row 6)
+        dC_dt[5, [0, 2]] = -12 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, [1, 3, 4, 5, 7, 8]] = 4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, [6, 9, 10]] = -4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        # Row 6 (R's row 7)
+        dC_dt[6, [0, 4]] = -18 * m / (256 * (1 + m * t) ** 3)
+        dC_dt[6, [1, 2, 3, 6, 7]] = 6 * m / (256 * (1 + m * t) ** 3)
+        dC_dt[6, [5, 8, 9, 10]] = -2 * m / (256 * (1 + m * t) ** 3)
+        # Row 7 (R's row 8)
+        dC_dt[7, 0] = -24 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[7, 1] = -8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[7, [2, 3, 4, 5, 6]] = 8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[7, [7, 10]] = -8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[7, [8, 9]] = 0
+        # Row 8 (R's row 9)
+        dC_dt[8, 0] = -48 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[8, [1, 2, 3, 4]] = 16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[8, [5, 6, 7]] = -16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[8, [8, 9]] = 0
+        dC_dt[8, 10] = 16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        # Row 9 (R's row 10)
+        dC_dt[9, 0] = -6 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
+                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
+                                + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, [1, 2, 3]] = 2 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
+                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
+                                       + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
+                                      256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, 4] = -2 * m * (mt ** 2 * (2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18) + 8 * mt * (
+                    3 * mt ** 3 + 9 * mt ** 2 - 2 * mt - 12)
+                                + 16 * (4 * mt ** 3 + 15 * mt ** 2 + 9 * mt - 6)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, 5] = m * (2 * mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 8 * mt * (
+                    2 * mt ** 4 + 6 * mt ** 3 - 4 * mt ** 2 - 20 * mt - 12)
+                           + 16 * (-2 * mt ** 5 - 12 * mt ** 4 - 22 * mt ** 3 - 6 * mt ** 2 + 18 * mt + 12)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, [6, 7]] = 2 * (m ** 2) * t * (4 * (-3 * mt ** 3 - 9 * mt ** 2 + 2 * mt + 12) + mt * (
+                    -2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18)) / (
+                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, [8, 9]] = 2 * (m ** 2) * t * (mt * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * (
+                    mt ** 4 + 3 * mt ** 3 - 2 * mt ** 2 - 10 * mt - 6)) / (
+                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[9, 10] = 2 * (m ** 3) * (t ** 2) * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+
+        # 5) DC/D(theta) 2nd order derivative
+        mt = m * t  # for ease of notation
+        DC_Dt = np.matrix(np.zeros((10, 11)))
+        # Row 0 (R's row 1)
+        DC_Dt[0, :] = 0
+        # Row 1 (R's row 2)
+        DC_Dt[1, [0, 2, 3, 4, 7]] = 3 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[1, [1, 5, 6, 8, 9, 10]] = -1 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        # Row 2 (R's row 3)
+        DC_Dt[2, [0, 3]] = 6 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[2, [1, 5, 9]] = 2 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[2, [2, 4, 6, 7, 8, 10]] = -2 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        # Row 3 (R's row 4)
+        DC_Dt[3, [0, 3]] = 12 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[3, [1, 2, 4, 5, 7, 9]] = -4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[3, [6, 8, 10]] = 4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        # Row 4 (R's row 5)
+        DC_Dt[4, 0] = 9 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, [1, 2]] = 5 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, [3, 7, 9, 10]] = -3 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, [4, 5, 6, 8]] = 1 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        # Row 5 (R's row 6)
+        DC_Dt[5, [0, 2]] = 12 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, [1, 3, 4, 5, 7, 8]] = -4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, [6, 9, 10]] = 4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        # Row 6 (R's row 7)
+        DC_Dt[6, [0, 4]] = 9 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
+        DC_Dt[6, [1, 2, 3, 6, 7]] = -3 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
+        DC_Dt[6, [5, 8, 9, 10]] = 1 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
+        # Row 7 (R's row 8)
+        DC_Dt[7, 0] = 24 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[7, 1] = 8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[7, [2, 3, 4, 5, 6]] = -8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[7, [7, 10]] = 8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[7, [8, 9]] = 0
+        # Row 8 (R's row 9)
+        DC_Dt[8, 0] = 48 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[8, [1, 2, 3, 4]] = -16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[8, [5, 6, 7]] = 16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (
+                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[8, [8, 9]] = 0
+        DC_Dt[8, 10] = -16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        # Row 9 (R's row 10)
+        DC_Dt[9, 0] = 12 * m ** 2 * (
+                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
+                    + 4 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, [1, 2, 3]] = -4 * m ** 2 * (
+                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
+                    + 4 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
+                                      256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, 4] = 4 * m ** 2 * (16 * (10 * mt ** 5 + 75 * mt ** 4 + 185 * mt ** 3 + 129 * mt ** 2 - 99 * mt - 120)
+                                    + 48 * (
+                                                mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
+                                    + mt * (
+                                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, 5] = 2 * m ** 2 * (
+                    2 * mt * (3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                3 * mt ** 7 + 27 * mt ** 6 + 85 * mt ** 5 + 75 * mt ** 4 - 166 * mt ** 3 - 462 * mt ** 2 - 414 * mt - 132)
+                    - 8 * (
+                                3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, [6, 7]] = 4 * m ** 2 * (
+                    24 * (mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
+                    + mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, [8, 9]] = -2 * m ** 2 * (
+                    4 * (3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)
+                    - 2 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[9, 10] = 4 * (m ** 3) * t * (
+                    3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108) / (
+                               256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+
+        # Compute output first and second derivatives
+        # First derivatives of tau's
+        delta_t1 = np.array([0, -2 * m, 0, -m, 0, -m, -2 * m, 0, -m, 2 / t])
+        dp_dt1 = (W_a @ C.T @ (delta_t1 * beta)).T
+        delta_t2 = np.array([0, 0, -2 * m, -2 * m, 0, 0, 0, -m, -m, -2 * (m + 1 / t)])
+        dp_dt2 = (W_a @ C.T @ (delta_t2 * beta)).T
+        delta_t3 = np.array([0, 0, 0, 0, -2 * m, -2 * m, -2 * m, -2 * m, -2 * m, -2 * m])
+        dp_dt3 = (W_a @ C.T @ (delta_t3 * beta)).T
+
+        # First derivatives of theta
+        delta_t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 2 * (t2 - t1) / (t ** 2)])
+        dp_dt = W_a @ ((C.T @ (2 * delta_t * beta)).T + 2 * dC_dt.T @ np.matrix(beta).T)
+
+        # First derivatives of gamma's
+        dGt_dg = np.matrix(network_parameters.gamma.get_gamma_1st_deriv(quartet_tree_feature.gamma_id))  # ∂Γ_t / ∂γ_i for i in gamma_id
+        dGt_dg_p = p_Qt @ dGt_dg
+
+        # ------ First derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] ------
+        r = len(quartet_tree_feature.gamma_id)
+        columns = [Gamma_t * dp_dt1, Gamma_t * dp_dt2, Gamma_t * dp_dt3, Gamma_t * dp_dt]
+        if r > 0:  # Add the derivatives w.r.t. gamma's if r>0
+            columns.append(dGt_dg_p)
+        first_deriv = Omega @ np.hstack(columns)
+        # -------------------------------------------------------------------
+
+        # Second derivatives of tau's
+        dp_dt1t1 = (W_a @ C.T @ (delta_t1 * delta_t1 * beta)).T
+        dp_dt1t2 = (W_a @ C.T @ (delta_t1 * delta_t2 * beta)).T
+        dp_dt1t3 = (W_a @ C.T @ (delta_t1 * delta_t3 * beta)).T
+        dp_dt2t2 = (W_a @ C.T @ (delta_t2 * delta_t2 * beta)).T
+        dp_dt2t3 = (W_a @ C.T @ (delta_t2 * delta_t3 * beta)).T
+        dp_dt3t3 = (W_a @ C.T @ (delta_t3 * delta_t3 * beta)).T
+
+        # Second derivatives of tau & theta
+        delta_t1t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, -2 * (t + 2 * t1 - 2 * t2) / (t ** 3)])
+        delta_t2t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 2 * (t + 2 * (1 + mt) * (t1 - t2)) / (t ** 3)])
+        delta_t3t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4 * m * (t1 - t2) / (t ** 2)])
+        dp_dt1t = W_a @ ((C.T @ (2 * delta_t1t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t1 * beta).T)
+        dp_dt2t = W_a @ ((C.T @ (2 * delta_t2t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t2 * beta).T)
+        dp_dt3t = W_a @ ((C.T @ (2 * delta_t3t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t3 * beta).T)
+
+        # Second derivatives of tau & gamma
+        dGt_dg_dp_dt1 = dp_dt1 @ dGt_dg
+        dGt_dg_dp_dt2 = dp_dt2 @ dGt_dg
+        dGt_dg_dp_dt3 = dp_dt3 @ dGt_dg
+
+        # Second derivatives of theta
+        delta_tt = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4 * (t1 - t2) * (t + t1 - t2) / (t ** 4)])
+        dp_dtt = W_a @ ((4 * C.T @ (delta_tt * beta)).T + 8 * dC_dt.T @ np.matrix(
+            delta_t * beta).T + 4 * DC_Dt.T @ np.matrix(beta).T)
+
+        # Second derivatives of theta & gamma
+        dGt_dg_dp_dt = dp_dt @ dGt_dg
+
+        # Second derivatives of gamma's
+        dGt_dgg = network_parameters.gamma.get_gamma_2nd_deriv(quartet_tree_feature.gamma_id)  # ∂²Γ_t / (∂γ_i ∂γ_j) for i,j in gamma_id
+        # dGt_dgg_p[i,j] = p_Qt * dGt_dgg[i, j] would be a 3D matrix with shape (r, r, 15)
+
+        # ------ Second derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] ------
+        second_deriv = np.zeros((4 + r, 4 + r, 15))
+        second_deriv[0, 0, :] = (Gamma_t * Omega @ dp_dt1t1).flatten()
+        second_deriv[0, 1, :] = (Gamma_t * Omega @ dp_dt1t2).flatten()
+        second_deriv[0, 2, :] = (Gamma_t * Omega @ dp_dt1t3).flatten()
+        second_deriv[0, 3, :] = (Gamma_t * Omega @ dp_dt1t).flatten()
+        second_deriv[1, 1, :] = (Gamma_t * Omega @ dp_dt2t2).flatten()
+        second_deriv[1, 2, :] = (Gamma_t * Omega @ dp_dt2t3).flatten()
+        second_deriv[1, 3, :] = (Gamma_t * Omega @ dp_dt2t).flatten()
+        second_deriv[2, 2, :] = (Gamma_t * Omega @ dp_dt3t3).flatten()
+        second_deriv[2, 3, :] = (Gamma_t * Omega @ dp_dt3t).flatten()
+        second_deriv[3, 3, :] = (Gamma_t * Omega @ dp_dtt).flatten()
+        # Add the derivatives w.r.t. gamma's if r>0
+        if r > 0:
+            for i in range(r):
+                gamma_idx = 4 + i  # This shifts the index to start at 4
+
+                second_deriv[0, gamma_idx, :] = (Omega @ dGt_dg_dp_dt1[:, i]).flatten()
+                second_deriv[1, gamma_idx, :] = (Omega @ dGt_dg_dp_dt2[:, i]).flatten()
+                second_deriv[2, gamma_idx, :] = (Omega @ dGt_dg_dp_dt3[:, i]).flatten()
+                second_deriv[3, gamma_idx, :] = (Omega @ dGt_dg_dp_dt[:, i]).flatten()
+                second_deriv[gamma_idx, gamma_idx, :] = (Omega @ p_Qt * dGt_dgg[i, i]).flatten()
+                # Cross-derivatives between different gammas
+                for j in range(i + 1, r):
+                    gamma_jdx = 4 + j
+                    second_deriv[gamma_idx, gamma_jdx, :] = (Omega @ p_Qt * dGt_dgg[i, j]).flatten()
+        # Mirror the upper triangle to the lower triangle across all 15 slices
+        for i in range(4 + r):
+            for j in range(i + 1, 4 + r):
+                second_deriv[j, i, :] = second_deriv[i, j, :]
+        # ---------------------------------------------------------------------------
+
+        # ---- Output ----
+        # first_deriv: first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
+        # second_deriv: second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
+        # ----------------
+        return first_deriv, second_deriv
 
 class SymmQuartet(QuartetTreeTopology):
     """Symmetric Quartet Topology Strategy: ((A,B),(C,D))"""
@@ -1404,12 +1780,351 @@ class SymmQuartet(QuartetTreeTopology):
         WS_pinv = np.linalg.inv(W_s.T @ W_s) @ W_s.T  # pseudo-inverse
         return Coef_s @ WS_pinv  # Precompute full transformation matrix
 
-    def get_MOM_tau(self, p_hat_Q, theta):
+    def get_MOM_tau(self, p_hat_Q: np.ndarray, theta: float):
         """Returns MOM estimators of [tau1, tau2, tau3] of symmetric quartet. tau3 is root age."""
         mu = 4 / 3
         y = np.array(4 * (1 + mu * 2 * theta) * (self.MOM_mat @ p_hat_Q)).ravel()  # convert 2D matrix to 1D array
         MOM_tau = -np.log(y ** (1 / (2 * mu)))
         return MOM_tau
+
+    # noinspection PyTypeChecker
+    def Qt_1st_2nd_deriv(self, network_parameters: NetworkParameters,
+                               quartet_tree_feature: "QuartetTreeFeature"):
+        """
+        For Q_t with len(gamma_id) = r, the length of parameters for this Q_t is 3 + 1 + r (tau's + theta + gamma's).
+        Get the first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}], and
+        get the second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric.
+        """
+
+        # Prepare quartet parameters used to compute site pattern probabilities
+        t1, t2, t3, theta_tilde = network_parameters.tree.get_tau_theta(quartet_tree_feature.param_idx)
+        t = 2 * theta_tilde  # 2*theta.tilde
+        m = 4 / 3  # mu for JC69
+
+        # 15-categ TrueProbs of quartet Q_t pulled from D_t
+        p_Qt = np.matrix(quartet_tree_feature.topology.get_true_probs(t1, t2, t3, theta_tilde, m)).T
+        # get gamma weight for Q_t (Gamma_t)
+        Gamma_t = network_parameters.gamma.get_gamma_weight(quartet_tree_feature.gamma_id)
+        # Get 15 category permutation matrix (Ω_t)
+        Omega = quartet_tree_feature.get_site_pattern_map_matrix()
+
+        # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric and
+        # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
+        # We need: 1) beta vector, 2) W_s weight matrix, 3) C coefficient matrix, 4) dC/d(theta) 1st order derivative of
+        # the C coefficient matrix w.r.t. theta, 5) DC/D(theta) 2nd order derivative the C coefficient matrix w.r.t. theta
+
+        # 1) beta vector
+        beta = np.array(
+            [1, np.exp(-2 * m * t1), np.exp(-2 * m * t2), np.exp(-2 * m * t1 - 2 * m * t2), np.exp(-2 * m * t3),
+             np.exp(-m * t1 - 2 * m * t3),
+             np.exp(-m * t2 - 2 * m * t3), np.exp(-m * t1 - m * t2 - 2 * m * t3),
+             np.exp(2 * t1 / t + 2 * t2 / t - 4 * t3 * (m + 1 / t))])
+
+        # 2) W_s weight matrix
+        W_s = np.matrix([[4, 0, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 12, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 12, 0, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 12, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 12, 0, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 12, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 12, 0, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 12, 0, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
+                         [0, 0, 0, 0, 0, 24, 0, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 24, 0, 0],
+                         [0, 0, 0, 0, 0, 0, 0, 0, 24]])
+
+        # 3) C coefficient matrix
+        C = np.matrix(np.zeros((9, 9)))
+        # Row 0 (R's row 1)
+        C[0, :] = 1 / 256
+        # Row 1 (R's row 2)
+        C[1, [0, 2, 4, 6]] = 3 / (256 * (1 + m * t))
+        C[1, [1, 3, 5, 7, 8]] = -1 / (256 * (1 + m * t))
+        # Row 2 (R's row 3)
+        C[2, [0, 1, 4, 5]] = 3 / (256 * (1 + m * t))
+        C[2, [2, 3, 6, 7, 8]] = -1 / (256 * (1 + m * t))
+        # Row 3 (R's row 4)
+        C[3, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
+        C[3, [1, 2, 5, 6]] = -3 / (256 * (1 + m * t) ** 2)
+        C[3, [3, 7, 8]] = 1 / (256 * (1 + m * t) ** 2)
+        # Row 4 (R's row 5)
+        C[4, 0] = 12 / (256 * (1 + m * t))
+        C[4, [1, 2, 3]] = 4 / (256 * (1 + m * t))
+        C[4, [4, 5, 6, 8]] = -4 / (256 * (1 + m * t))
+        C[4, 7] = 0
+        # Row 5 (R's row 6)
+        C[5, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, [1, 3, 4, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, 2] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, [5, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[5, 7] = 0
+        # Row 6 (R's row 7)
+        C[6, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
+        C[6, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[6, [2, 3, 4, 5]] = -8 / (256 * (1 + m * t) * (2 + m * t))
+        C[6, [6, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
+        C[6, 7] = 0
+        # Row 7 (R's row 8)
+        C[7, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[7, [1, 2, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[7, [3, 5, 6]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        C[7, 7] = 0
+        C[7, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
+        # Row 8 (R's row 9)
+        C[8, 0] = 6 * m * t * (4 + m * t) * (4 + 3 * m * t) / (
+                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, [1, 2]] = -2 * m * t * (4 + m * t) * (4 + 3 * m * t) / (
+                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, 3] = m * t * (32 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (
+                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, 4] = 2 * m * t * (4 + m * t) ** 2 / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, [5, 6]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (
+                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, 7] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+        C[8, 8] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
+
+        # 4) dC/d(theta) 1st order derivative
+        dC_dt = np.matrix(np.zeros((9, 9)))
+        # Row 0 (R's row 1)
+        dC_dt[0, :] = 0
+        # Row 1 (R's row 2)
+        dC_dt[1, [0, 2, 4, 6]] = -3 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[1, [1, 3, 5, 7, 8]] = m / (256 * (1 + m * t) ** 2)
+        # Row 2 (R's row 3)
+        dC_dt[2, [0, 1, 4, 5]] = -3 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[2, [2, 3, 6, 7, 8]] = m / (256 * (1 + m * t) ** 2)
+        # Row 3 (R's row 4)
+        dC_dt[3, [0, 4]] = -18 * m / (256 * (1 + m * t) ** 3)
+        dC_dt[3, [1, 2, 5, 6]] = 6 * m / (256 * (1 + m * t) ** 3)
+        dC_dt[3, [3, 7, 8]] = -2 * m / (256 * (1 + m * t) ** 3)
+        # Row 4 (R's row 5)
+        dC_dt[4, 0] = -12 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, [1, 2, 3]] = -4 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, [4, 5, 6, 8]] = 4 * m / (256 * (1 + m * t) ** 2)
+        dC_dt[4, 7] = 0
+        # Row 5 (R's row 6)
+        dC_dt[5, 0] = -24 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, [1, 3, 4, 6]] = 8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, 2] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, [5, 8]] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[5, 7] = 0
+        # Row 6 (R's row 7)
+        dC_dt[6, 0] = -24 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[6, 1] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[6, [2, 3, 4, 5]] = 8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[6, [6, 8]] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
+        dC_dt[6, 7] = 0
+        # Row 7 (R's row 8)
+        dC_dt[7, 0] = -48 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[7, [1, 2, 4]] = 16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[7, [3, 5, 6]] = -16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        dC_dt[7, 7] = 0
+        dC_dt[7, 8] = 16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
+        # Row 8 (R's row 9)
+        mt = m * t  # for ease of notation
+        dC_dt[8, 0] = -6 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
+                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
+                                + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, [1, 2]] = 2 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
+                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
+                                    + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
+                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, 3] = m * (2 * mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 8 * mt * (
+                    2 * mt ** 4 + 6 * mt ** 3 - 4 * mt ** 2 - 20 * mt - 12)
+                           + 16 * (-2 * mt ** 5 - 12 * mt ** 4 - 22 * mt ** 3 - 6 * mt ** 2 + 18 * mt + 12)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, 4] = -2 * m * (mt ** 2 * (2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18) + 8 * mt * (
+                    3 * mt ** 3 + 9 * mt ** 2 - 2 * mt - 12)
+                                + 16 * (4 * mt ** 3 + 15 * mt ** 2 + 9 * mt - 6)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, [5, 6]] = 2 * (m ** 2) * t * (4 * (-3 * mt ** 3 - 9 * mt ** 2 + 2 * mt + 12) + mt * (
+                    -2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18)) / (
+                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, 7] = 2 * (m ** 2) * t * (mt * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * (
+                    mt ** 4 + 3 * mt ** 3 - 2 * mt ** 2 - 10 * mt - 6)) / (
+                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+        dC_dt[8, 8] = 2 * (m ** 3) * (t ** 2) * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) / (
+                256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
+
+        # 5) DC/D(theta) 2nd order derivative
+        mt = m * t  # for ease of notation
+        DC_Dt = np.matrix(np.zeros((9, 9)))
+        # Row 0 (R's row 1)
+        DC_Dt[0, :] = 0
+        # Row 1 (R's row 2)
+        DC_Dt[1, [0, 2, 4, 6]] = 6 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[1, [1, 3, 5, 7, 8]] = -2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        # Row 2 (R's row 3)
+        DC_Dt[2, [0, 1, 4, 5]] = 6 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[2, [2, 3, 6, 7, 8]] = -2 * m ** 2 / (256 * (1 + m * t) ** 3)
+        # Row 3 (R's row 4)
+        DC_Dt[3, [0, 4]] = 54 * m ** 2 / (256 * (1 + m * t) ** 4)
+        DC_Dt[3, [1, 2, 5, 6]] = -18 * m ** 2 / (256 * (1 + m * t) ** 4)
+        DC_Dt[3, [3, 7, 8]] = 6 * m ** 2 / (256 * (1 + m * t) ** 4)
+        # Row 4 (R's row 5)
+        DC_Dt[4, 0] = 24 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, [1, 2, 3]] = 8 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, [4, 5, 6, 8]] = -8 * m ** 2 / (256 * (1 + m * t) ** 3)
+        DC_Dt[4, 7] = 0
+        # Row 5 (R's row 6)
+        DC_Dt[5, 0] = 48 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, [1, 3, 4, 6]] = -16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, 2] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, [5, 8]] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[5, 7] = 0
+        # Row 6 (R's row 7)
+        DC_Dt[6, 0] = 48 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[6, 1] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[6, [2, 3, 4, 5]] = -16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[6, [6, 8]] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
+        DC_Dt[6, 7] = 0
+        # Row 7 (R's row 8)
+        DC_Dt[7, 0] = 96 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[7, [1, 2, 4]] = -32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[7, [3, 5, 6]] = 32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        DC_Dt[7, 7] = 0
+        DC_Dt[7, 8] = 32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
+        # Row 8 (R's row 9)
+        DC_Dt[8, 0] = 12 * m ** 2 * (
+                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
+                    + 4 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, [1, 2]] = -4 * m ** 2 * (
+                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
+                    + 4 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
+                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, 3] = 2 * m ** 2 * (
+                    2 * mt * (3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
+                    + 16 * (
+                                3 * mt ** 7 + 27 * mt ** 6 + 85 * mt ** 5 + 75 * mt ** 4 - 166 * mt ** 3 - 462 * mt ** 2 - 414 * mt - 132)
+                    - 8 * (
+                                3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, 4] = 4 * m ** 2 * (16 * (10 * mt ** 5 + 75 * mt ** 4 + 185 * mt ** 3 + 129 * mt ** 2 - 99 * mt - 120)
+                                    + 48 * (
+                                                mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
+                                    + mt * (
+                                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, [5, 6]] = 4 * m ** 2 * (
+                    24 * (mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
+                    + mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, 7] = -2 * m ** 2 * (
+                    4 * (3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)
+                    - 2 * mt * (
+                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+        DC_Dt[8, 8] = 4 * (m ** 3) * t * (
+                    3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108) / (
+                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
+
+        # Compute output first and second derivatives
+        # First derivatives of tau's
+        delta_t1 = np.array([0, -2 * m, 0, -2 * m, 0, -m, 0, -m, 2 / t])
+        dp_dt1 = (W_s @ C.T @ (delta_t1 * beta)).T
+        delta_t2 = np.array([0, 0, -2 * m, -2 * m, 0, 0, -m, -m, 2 / t])
+        dp_dt2 = (W_s @ C.T @ (delta_t2 * beta)).T
+        delta_t3 = np.array([0, 0, 0, 0, -2 * m, -2 * m, -2 * m, -2 * m, -4 * (m + 1 / t)])
+        dp_dt3 = (W_s @ C.T @ (delta_t3 * beta)).T
+
+        # First derivatives of theta
+        delta_t = np.array([0, 0, 0, 0, 0, 0, 0, 0, (4 * t3 - 2 * (t1 + t2)) / (t ** 2)])
+        dp_dt = W_s @ ((C.T @ (2 * delta_t * beta)).T + 2 * dC_dt.T @ np.matrix(beta).T)
+
+        # First derivatives of gamma's
+        dGt_dg = np.matrix(network_parameters.gamma.get_gamma_1st_deriv(quartet_tree_feature.gamma_id))  # ∂Γ_t / ∂γ_i for i in gamma_id
+        dGt_dg_p = p_Qt @ dGt_dg
+
+        # ------ First derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] ------
+        r = len(quartet_tree_feature.gamma_id)
+        columns = [Gamma_t * dp_dt1, Gamma_t * dp_dt2, Gamma_t * dp_dt3, Gamma_t * dp_dt]
+        if r > 0: # Add the derivatives w.r.t. gamma's if r>0
+            columns.append(dGt_dg_p)
+        first_deriv = Omega @ np.hstack(columns)
+        # -------------------------------------------------------------------
+
+        # Second derivatives of tau's
+        dp_dt1t1 = (W_s @ C.T @ (delta_t1 * delta_t1 * beta)).T
+        dp_dt1t2 = (W_s @ C.T @ (delta_t1 * delta_t2 * beta)).T
+        dp_dt1t3 = (W_s @ C.T @ (delta_t1 * delta_t3 * beta)).T
+        dp_dt2t2 = (W_s @ C.T @ (delta_t2 * delta_t2 * beta)).T
+        dp_dt2t3 = (W_s @ C.T @ (delta_t2 * delta_t3 * beta)).T
+        dp_dt3t3 = (W_s @ C.T @ (delta_t3 * delta_t3 * beta)).T
+
+        # Second derivatives of tau & theta
+        delta_t1t = delta_t2t = np.array([0, 0, 0, 0, 0, 0, 0, 0, -2 * (t + 2 * t1 + 2 * t2 - 4 * t3) / (t ** 3)])
+        delta_t3t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 4 * (t + (2 * t1 + 2 * t2 - 4 * t3) * (1 + m * t)) / (t ** 3)])
+        dp_dt1t = W_s @ ((C.T @ (2 * delta_t1t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t1 * beta).T)
+        dp_dt2t = W_s @ ((C.T @ (2 * delta_t2t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t2 * beta).T)
+        dp_dt3t = W_s @ ((C.T @ (2 * delta_t3t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t3 * beta).T)
+
+        # Second derivatives of tau & gamma
+        dGt_dg_dp_dt1 = dp_dt1 @ dGt_dg
+        dGt_dg_dp_dt2 = dp_dt2 @ dGt_dg
+        dGt_dg_dp_dt3 = dp_dt3 @ dGt_dg
+
+        # Second derivatives of theta
+        delta_tt = np.array([0, 0, 0, 0, 0, 0, 0, 0, 4 * (t1 + t2 - 2 * t3) * (t + t1 + t2 - 2 * t3) / (t ** 4)])
+        dp_dtt = W_s @ ((4 * C.T @ (delta_tt * beta)).T + 8 * dC_dt.T @ np.matrix(
+            delta_t * beta).T + 4 * DC_Dt.T @ np.matrix(beta).T)
+
+        # Second derivatives of theta & gamma
+        dGt_dg_dp_dt = dp_dt @ dGt_dg
+
+        # Second derivatives of gamma's
+        dGt_dgg = network_parameters.gamma.get_gamma_2nd_deriv(quartet_tree_feature.gamma_id)  # ∂²Γ_t / (∂γ_i ∂γ_j) for i,j in gamma_id
+        # dGt_dgg_p[i,j] = p_Qt * dGt_dgg[i, j] would be a 3D matrix with shape (r, r, 15)
+
+        # ------ Second derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] ------
+        second_deriv = np.zeros((4+r, 4+r, 15))
+        second_deriv[0, 0, :] = (Gamma_t * Omega @ dp_dt1t1).flatten()
+        second_deriv[0, 1, :] = (Gamma_t * Omega @ dp_dt1t2).flatten()
+        second_deriv[0, 2, :] = (Gamma_t * Omega @ dp_dt1t3).flatten()
+        second_deriv[0, 3, :] = (Gamma_t * Omega @ dp_dt1t).flatten()
+        second_deriv[1, 1, :] = (Gamma_t * Omega @ dp_dt2t2).flatten()
+        second_deriv[1, 2, :] = (Gamma_t * Omega @ dp_dt2t3).flatten()
+        second_deriv[1, 3, :] = (Gamma_t * Omega @ dp_dt2t).flatten()
+        second_deriv[2, 2, :] = (Gamma_t * Omega @ dp_dt3t3).flatten()
+        second_deriv[2, 3, :] = (Gamma_t * Omega @ dp_dt3t).flatten()
+        second_deriv[3, 3, :] = (Gamma_t * Omega @ dp_dtt).flatten()
+        # Add the derivatives w.r.t. gamma's if r>0
+        if r > 0:
+            for i in range(r):
+                gamma_idx = 4 + i  # This shifts the index to start at 4
+
+                second_deriv[0, gamma_idx, :] = (Omega @ dGt_dg_dp_dt1[:, i]).flatten()
+                second_deriv[1, gamma_idx, :] = (Omega @ dGt_dg_dp_dt2[:, i]).flatten()
+                second_deriv[2, gamma_idx, :] = (Omega @ dGt_dg_dp_dt3[:, i]).flatten()
+                second_deriv[3, gamma_idx, :] = (Omega @ dGt_dg_dp_dt[:, i]).flatten()
+                second_deriv[gamma_idx, gamma_idx, :] = (Omega @ p_Qt * dGt_dgg[i, i]).flatten()
+                # Cross-derivatives between different gammas
+                for j in range(i + 1, r):
+                    gamma_jdx = 4 + j
+                    second_deriv[gamma_idx, gamma_jdx, :] = (Omega @ p_Qt * dGt_dgg[i, j]).flatten()
+        # Mirror the upper triangle to the lower triangle across all 15 slices
+        for i in range(4 + r):
+            for j in range(i + 1, 4 + r):
+                second_deriv[j, i, :] = second_deriv[i, j, :]
+        # ---------------------------------------------------------------------------
+
+        # ---- Output ----
+        # first_deriv: first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
+        # second_deriv: second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
+        # ----------------
+        return first_deriv, second_deriv
 
 
 ##############################################################################################################
@@ -1569,6 +2284,18 @@ class QuartetFeature:
     taxa: tuple
     tree_features: list["QuartetTreeFeature"]
 
+    def copy(self):
+        """Returns a deep copy of the SpeciesNetwork instance."""
+        return copy.deepcopy(self)
+    def __copy__(self):
+        return self.copy()
+    def __deepcopy__(self, memo) -> "QuartetFeature":
+        """Support for standard library `copy.deepcopy()` calls."""
+        return QuartetFeature(
+            taxa=self.taxa,  # Tuples are immutable, no deep copy needed
+            tree_features=copy.deepcopy(self.tree_features, memo)
+        )
+
     @property
     def param_idx(self):
         """Delegates param_idx directly to the underlying QuartetTreeFeature."""
@@ -1645,22 +2372,6 @@ class QuartetFeature:
 
         return TrueProbs
 
-    def get_MOM_tau(self, p_hat_Q, theta, num_tau):
-        """Computes MOM estimators of [tau1, tau2, tau3, theta] for this quartet subnetwork. tau3 is root age."""
-        tau_sum = np.zeros(num_tau)
-        tau_count = np.zeros(num_tau)
-
-        for qt_feature in self.tree_features:
-            tau_idx = (num_tau - qt_feature.param_idx)[:3]  # convert to 0-based indexing
-            sp_relation = qt_feature.get_site_pattern_relationship(inverse = True)
-            tau_vals = qt_feature.topology.get_MOM_tau(p_hat_Q[sp_relation], theta)
-
-            # Accumulate the reversed values
-            tau_sum[tau_idx] += tau_vals[::-1]
-            tau_count[tau_idx] += 1
-
-        return tau_sum, tau_count
-
 @dataclass
 class PairedQuartetFeature:
     """Encapsulates paired seq_data_rows with quartet features (param_idx, is_asymm, taxa_perm, gamma_id)"""
@@ -1698,6 +2409,78 @@ class QuartetData:
         self.quartet_feature.
         """
         return getattr(self.quartet_feature, name)
+
+    def get_MOM_tau(self, theta, num_tau):
+        """Computes MOM estimators of [tau1, tau2, tau3, theta] for this quartet subnetwork. tau3 is root age."""
+        tau_sum = np.zeros(num_tau)
+        tau_count = np.zeros(num_tau)
+        p_hat_Q = self.n_Q / self.n_Q.sum()
+
+        for qt_feature in self.tree_features:
+            tau_idx = (num_tau - np.array(qt_feature.param_idx))[:3]  # convert to 0-based indexing
+            sp_relation = qt_feature.get_site_pattern_relationship(inverse = True)
+            tau_vals = qt_feature.topology.get_MOM_tau(p_hat_Q[sp_relation], theta)
+
+            # Accumulate the reversed values
+            tau_sum[tau_idx] += tau_vals[::-1]
+            tau_count[tau_idx] += 1
+
+        return tau_sum, tau_count
+
+    def get_grad_hess_quartet(self, network_parameters: NetworkParameters):
+        """Get the gradient vector and Hessian matrix of the quartet likelihood with quartet features (param_idx, is_asymm,
+        taxa_perm, gamma_id) given parameters."""
+        # Our goal: Get (i) gradient vector and (ii) Hessian matrix of the quartet network log likelihood
+        # Given p_Q = Σ[Γ_t * Ω_t @ p_{D^Q_t}], we need to
+        # 1) get the first and second derivatives of [Γ_t * Ω_t @ p_{D^Q_t}] when D^Q_t is symmetric and asymmetric quartet,
+        # 2) accumulate these derivatives to get the first and second derivatives of p_Q, and
+        # 3) get the gradient and Hessian according to formulas in my Appendix.
+
+        # Get parameters, gamma_weights and true site pattern probs
+        num_tau = network_parameters.num_tau    # number of tau's
+        num_param = network_parameters.total_params
+        Q_param_idx = set()
+
+        # Create zero matrices for summation.
+        first_der_p_Q = np.zeros((15, num_param))
+        second_der_p_Q = np.zeros((num_param, num_param, 15))
+
+        # Remove common gamma indices in gamma_id for the ease of taking derivative of Gamma_t
+        gamma_id_clean = network_parameters.gamma.remove_common_elements(self.gamma_id)
+
+        for qt_feat, gamma_id in zip(self.tree_features, gamma_id_clean):
+            # ---- Step 1: Get the first and second derivatives of [Γ_t * Ω_t @ p_{D^Q_t}] ----
+            first_der_qt, second_der_qt = qt_feat.topology.Qt_1st_2nd_deriv(network_parameters, qt_feat)
+
+            # Get all indices of the tau's, theta, gamma's of this D^Q_t quartet
+            # param_idx reversed because tau_id in Qt_1st_2nd_deriv() is [t1,t2,t3] but param_idx is [t3,t2,t1]
+            tau_idx = num_tau - qt_feat.param_idx[::-1]      # Convert to 0-based indices for tau.
+            theta_idx = [num_tau]             # Convert to 0-based indices for theta
+            if gamma_id.size > 0:
+                gamma_idx = num_tau + np.abs(gamma_id)     # Convert to 0-based indices for gamma
+                Qt_param_idx = np.concatenate((tau_idx, theta_idx, gamma_idx))
+            else:
+                Qt_param_idx = np.concatenate((tau_idx, theta_idx))
+            Q_param_idx.update(Qt_param_idx)
+
+            # ---- Step 2: Accumulate these derivatives to get the first and second derivatives of p_Q ----
+            # Accumulate to first_der_p_Q by Qt_param_idx
+            first_der_p_Q[:, Qt_param_idx] += first_der_qt
+
+            # Accumulate to second_der_p_Q by Qt_param_idx
+            row_idx, col_idx = np.ix_(Qt_param_idx, Qt_param_idx)
+            second_der_p_Q[row_idx, col_idx, :] += second_der_qt
+
+        # ---- Step 3: get the gradient and Hessian of this quartet subnetwork ----
+        p_Q = self.getTrueProbsQuartet(network_parameters)
+        # R_Q matrix = gradient vector of log(p_Q)
+        R_Q_mat = first_der_p_Q.T / p_Q
+
+        n_Q_div_p2_Q = self.n_Q / np.square(p_Q)     # shape (15,)
+        n_Q_div_p_Q = self.n_Q / p_Q                 # shape (15,)
+        # H_Q matrix = Hessian matrix of l(Q)
+        H_Q_mat = (n_Q_div_p2_Q * first_der_p_Q.T) @ first_der_p_Q - second_der_p_Q @ n_Q_div_p_Q
+        return R_Q_mat, H_Q_mat
 
 
 #################################################################################
@@ -2081,10 +2864,15 @@ Quartet likelihood: {comp_log_lik}
 ## Find MCLE for species network composite likelihood ##
 ########################################################
 
+def log_beta(x, alpha, beta):
+    """Computes kernals of log Beta distribution with shape alpha and scale beta."""
+    if not 0 <= x <= 1:
+        return -np.inf
+    return np.sum((alpha - 1) * np.log(x) * (beta - 1) * np.log(1 - x))
 
 def log_invgamma(x, alpha, beta):
     """Computes kernals of log Inverse Gamma distribution with shape alpha and scale beta."""
-    if x <= 0:
+    if not x >= 0:
         return -np.inf
     return -(alpha + 1) * np.log(x) - beta / x
 
@@ -2101,7 +2889,7 @@ class ParameterTransformer:
         num_tau = self.labeled_network.num_tau
         num_retic = self.labeled_network.num_retic
 
-        tree_parameters = params[:-num_retic]
+        tree_parameters = params[:num_tau + 1]
         gamma_parameters = params[-num_retic:] if num_retic > 0 else np.array([])
 
         trans_gamma = np.arcsin(np.sqrt(gamma_parameters))
@@ -2124,7 +2912,7 @@ class ParameterTransformer:
         num_tau = self.labeled_network.num_tau
         num_retic = self.labeled_network.num_retic
 
-        trans_tree = trans_param[:-num_retic]
+        trans_tree = trans_param[:num_tau + 1]
         trans_gamma = trans_param[-num_retic:]
 
         gamma = np.sin(trans_gamma) ** 2
@@ -2154,8 +2942,7 @@ class MOMEstimator:
         tau_count = np.zeros(num_tau)
 
         for q_data in self.all_quartet_data:
-            p_hat_Q = q_data.n_Q / q_data.n_Q.sum()
-            t_sum, t_count = q_data.get_MOM_tau(p_hat_Q, theta, num_tau)
+            t_sum, t_count = q_data.get_MOM_tau(theta, num_tau)
             tau_sum += t_sum
             tau_count += t_count
 
@@ -2194,9 +2981,10 @@ class TauPriorTauConstraint:
 
         # Extract the parent and child columns as separate 1D arrays
         if constraints:
+            constraints_arr = np.array(constraints)  # Convert list to NumPy array
             # Adjust for 0-based array indexing: index = num_tau - label
-            p_idx = self.num_tau - np.array(constraints[:, 0])
-            c_idx = self.num_tau - np.array(constraints[:, 1])
+            p_idx = self.num_tau - constraints_arr[:, 0]
+            c_idx = self.num_tau - constraints_arr[:, 1]
             return p_idx, c_idx
 
         return np.array([], dtype=int), np.array([], dtype=int)
@@ -2301,7 +3089,6 @@ class Optimizer:
         self.num_tau = self.network.num_tau
         self.total_params = self.num_tau + 1 + self.num_retic  # tau's + theta + gamma's
 
-
     @staticmethod
     def expand_trans_param(compressed_vec: np.ndarray, is_fixed_param: np.ndarray):
         """Expands compressed active parameter vector into full length according to fixed parameter mask."""
@@ -2354,7 +3141,7 @@ class Optimizer:
         if not np.all(np.isfinite(raw_params)) or np.any(raw_params < 0):
             return np.inf
 
-        tree_vec = raw_params[:-self.num_retic]
+        tree_vec = raw_params[:self.num_tau + 1]
         gamma_vec = raw_params[-self.num_retic:] if self.num_retic > 0 else np.array([])
         net_params = NetworkParameters.from_vectors(tree_vec, gamma_vec)
 
@@ -2474,7 +3261,7 @@ class Optimizer:
     def get_MCLE_parameters(self, initial_gamma: np.ndarray | None = None,
                             is_fixed_param: np.ndarray | None = None,
                             multi_start: int | bool | None = None,
-                            warning: bool = False) -> tuple[NetworkParameters, float]:
+                            warning: bool = False):
         """
         Get MCLE for network parameters = [tau_1,...,tau_J, theta, gamma_1,...,gamma_h].
         'is_fixed_param' decides which parameters are fixed for constrained optimization.
@@ -2529,973 +3316,90 @@ class Optimizer:
         full_trans = self.expand_trans_param(trans_estimator, is_fixed_param)
         raw_estimator = self.transformer.parameter_backtransform(full_trans)
 
-        tree_vec = raw_estimator[:-self.num_retic]
+        tree_vec = raw_estimator[:self.num_tau + 1]
         gamma_vec = raw_estimator[-self.num_retic:] if self.num_retic > 0 else np.array([])
         mcle_net_params = NetworkParameters.from_vectors(tree_vec, gamma_vec)
 
         return mcle_net_params, max_comp_log_lik
 
 
-
-
 ###########################################################################################
-## Compute variability matrix J, sensitivity matrix H, and curvature adjustment matrix C ##
+## Compute curvature adjustment matrix C ##
 ###########################################################################################
 
-def get_Grad_Hess_Quartet(parameters, n_Q, param_idx, is_asymm, taxa_perm, gamma_id):
-    """Get the gradient vector and Hessian matrix of the quartet likelihood with quartet features (param_idx, is_asymm,
-    taxa_perm, gamma_id) given parameters."""
-    import itertools
-
-    # Our goal: Get (i) gradient vector and (ii) Hessian matrix of the quartet network log likelihood
-    # Given p_Q = Σ[Γ_t * Ω_t @ p_{D^Q_t}], we need to 1) get the first and second derivatives of
-    # [Γ_t * Ω_t @ p_{D^Q_t}] when D^Q_t is symmetric and asymmetric quartet, 2) accumulate these
-    # derivatives to get the first and second derivatives of p_Q, and 3) get the gradient and Hessian
-    # according to formulas in my Appendix.
-
-    # ---- Step 1: Get the first and second derivatives of [Γ_t * Ω_t @ p_{D^Q_t}] ----
-    def Qt_1st_2nd_deriv_Symm(tree_parameters, gamma_parameters, pi, tp, gi):
-        """(pi = param_idx, ia = is_asymm, tp = taxa_perm, gi = gamma_id)
-        For Q_t with len(gamma_id) = r, the length of parameters for this Q_t is 3 + 1 + r (tau's + theta + gamma's).
-        Get the first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}], and
-        get the second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric."""
-
-        # Prepare quartet parameters used to compute site pattern probabilities
-        t1, t2, t3, theta_tilde = get_tau_theta(tree_parameters, pi)
-        t = 2 * theta_tilde  # 2*theta.tilde
-        m = 4 / 3  # mu for JC69
-
-        # 15-categ TrueProbs of quartet p_{D^Q_t} pulled from D_t
-        p_Qt = np.matrix(getTrueProbsSymm(t1, t2, t3, theta_tilde, m)).T
-        # get gamma weight for Q_t (Γ_t)
-        Gamma_t = get_gamma_weight(gamma_parameters, gi)
-        # Get 15 category permutation matrix (Ω_t)
-        Omega = get_site_pattern_map_matrix(tp)
-
-        # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric and
-        # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
-        # We need: 1) beta vector, 2) W_s weight matrix, 3) C coefficient matrix, 4) dC/d(theta) 1st order derivative of
-        # the C coefficient matrix w.r.t. theta, 5) DC/D(theta) 2nd order derivative the C coefficient matrix w.r.t. theta
-
-        # 1) beta vector
-        beta = np.array(
-            [1, np.exp(-2 * m * t1), np.exp(-2 * m * t2), np.exp(-2 * m * t1 - 2 * m * t2), np.exp(-2 * m * t3),
-             np.exp(-m * t1 - 2 * m * t3),
-             np.exp(-m * t2 - 2 * m * t3), np.exp(-m * t1 - m * t2 - 2 * m * t3),
-             np.exp(2 * t1 / t + 2 * t2 / t - 4 * t3 * (m + 1 / t))])
-
-        # 2) W_s weight matrix
-        W_s = np.matrix([[4, 0, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 12, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 12, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 12, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 12, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 12, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 12, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 12, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 24, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 24, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 24]])
-
-        # 3) C coefficient matrix
-        C = np.matrix(np.zeros((9, 9)))
-        # Row 0 (R's row 1)
-        C[0, :] = 1 / 256
-        # Row 1 (R's row 2)
-        C[1, [0, 2, 4, 6]] = 3 / (256 * (1 + m * t))
-        C[1, [1, 3, 5, 7, 8]] = -1 / (256 * (1 + m * t))
-        # Row 2 (R's row 3)
-        C[2, [0, 1, 4, 5]] = 3 / (256 * (1 + m * t))
-        C[2, [2, 3, 6, 7, 8]] = -1 / (256 * (1 + m * t))
-        # Row 3 (R's row 4)
-        C[3, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
-        C[3, [1, 2, 5, 6]] = -3 / (256 * (1 + m * t) ** 2)
-        C[3, [3, 7, 8]] = 1 / (256 * (1 + m * t) ** 2)
-        # Row 4 (R's row 5)
-        C[4, 0] = 12 / (256 * (1 + m * t))
-        C[4, [1, 2, 3]] = 4 / (256 * (1 + m * t))
-        C[4, [4, 5, 6, 8]] = -4 / (256 * (1 + m * t))
-        C[4, 7] = 0
-        # Row 5 (R's row 6)
-        C[5, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, [1, 3, 4, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, 2] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, [5, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, 7] = 0
-        # Row 6 (R's row 7)
-        C[6, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
-        C[6, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[6, [2, 3, 4, 5]] = -8 / (256 * (1 + m * t) * (2 + m * t))
-        C[6, [6, 8]] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[6, 7] = 0
-        # Row 7 (R's row 8)
-        C[7, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[7, [1, 2, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[7, [3, 5, 6]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[7, 7] = 0
-        C[7, 8] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        # Row 8 (R's row 9)
-        C[8, 0] = 6 * m * t * (4 + m * t) * (4 + 3 * m * t) / (
-                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, [1, 2]] = -2 * m * t * (4 + m * t) * (4 + 3 * m * t) / (
-                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, 3] = m * t * (32 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (
-                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, 4] = 2 * m * t * (4 + m * t) ** 2 / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, [5, 6]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (
-                256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, 7] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-        C[8, 8] = 2 * (m ** 3) * (t ** 3) / (256 * ((1 + m * t) ** 2) * ((2 + m * t) ** 2) * (3 + m * t))
-
-        # 4) dC/d(theta) 1st order derivative
-        dC_dt = np.matrix(np.zeros((9, 9)))
-        # Row 0 (R's row 1)
-        dC_dt[0, :] = 0
-        # Row 1 (R's row 2)
-        dC_dt[1, [0, 2, 4, 6]] = -3 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[1, [1, 3, 5, 7, 8]] = m / (256 * (1 + m * t) ** 2)
-        # Row 2 (R's row 3)
-        dC_dt[2, [0, 1, 4, 5]] = -3 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[2, [2, 3, 6, 7, 8]] = m / (256 * (1 + m * t) ** 2)
-        # Row 3 (R's row 4)
-        dC_dt[3, [0, 4]] = -18 * m / (256 * (1 + m * t) ** 3)
-        dC_dt[3, [1, 2, 5, 6]] = 6 * m / (256 * (1 + m * t) ** 3)
-        dC_dt[3, [3, 7, 8]] = -2 * m / (256 * (1 + m * t) ** 3)
-        # Row 4 (R's row 5)
-        dC_dt[4, 0] = -12 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, [1, 2, 3]] = -4 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, [4, 5, 6, 8]] = 4 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, 7] = 0
-        # Row 5 (R's row 6)
-        dC_dt[5, 0] = -24 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, [1, 3, 4, 6]] = 8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, 2] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, [5, 8]] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, 7] = 0
-        # Row 6 (R's row 7)
-        dC_dt[6, 0] = -24 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[6, 1] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[6, [2, 3, 4, 5]] = 8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[6, [6, 8]] = -8 * m * (2 * m * t + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[6, 7] = 0
-        # Row 7 (R's row 8)
-        dC_dt[7, 0] = -48 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[7, [1, 2, 4]] = 16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[7, [3, 5, 6]] = -16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[7, 7] = 0
-        dC_dt[7, 8] = 16 * m * (3 * m * t + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        # Row 8 (R's row 9)
-        mt = m * t  # for ease of notation
-        dC_dt[8, 0] = -6 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
-                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
-                                + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, [1, 2]] = 2 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
-                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
-                                    + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
-                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, 3] = m * (2 * mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 8 * mt * (
-                    2 * mt ** 4 + 6 * mt ** 3 - 4 * mt ** 2 - 20 * mt - 12)
-                           + 16 * (-2 * mt ** 5 - 12 * mt ** 4 - 22 * mt ** 3 - 6 * mt ** 2 + 18 * mt + 12)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, 4] = -2 * m * (mt ** 2 * (2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18) + 8 * mt * (
-                    3 * mt ** 3 + 9 * mt ** 2 - 2 * mt - 12)
-                                + 16 * (4 * mt ** 3 + 15 * mt ** 2 + 9 * mt - 6)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, [5, 6]] = 2 * (m ** 2) * t * (4 * (-3 * mt ** 3 - 9 * mt ** 2 + 2 * mt + 12) + mt * (
-                    -2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18)) / (
-                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, 7] = 2 * (m ** 2) * t * (mt * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * (
-                    mt ** 4 + 3 * mt ** 3 - 2 * mt ** 2 - 10 * mt - 6)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[8, 8] = 2 * (m ** 3) * (t ** 2) * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) / (
-                256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-
-        # 5) DC/D(theta) 2nd order derivative
-        mt = m * t  # for ease of notation
-        DC_Dt = np.matrix(np.zeros((9, 9)))
-        # Row 0 (R's row 1)
-        DC_Dt[0, :] = 0
-        # Row 1 (R's row 2)
-        DC_Dt[1, [0, 2, 4, 6]] = 6 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[1, [1, 3, 5, 7, 8]] = -2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        # Row 2 (R's row 3)
-        DC_Dt[2, [0, 1, 4, 5]] = 6 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[2, [2, 3, 6, 7, 8]] = -2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        # Row 3 (R's row 4)
-        DC_Dt[3, [0, 4]] = 54 * m ** 2 / (256 * (1 + m * t) ** 4)
-        DC_Dt[3, [1, 2, 5, 6]] = -18 * m ** 2 / (256 * (1 + m * t) ** 4)
-        DC_Dt[3, [3, 7, 8]] = 6 * m ** 2 / (256 * (1 + m * t) ** 4)
-        # Row 4 (R's row 5)
-        DC_Dt[4, 0] = 24 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, [1, 2, 3]] = 8 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, [4, 5, 6, 8]] = -8 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, 7] = 0
-        # Row 5 (R's row 6)
-        DC_Dt[5, 0] = 48 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, [1, 3, 4, 6]] = -16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, 2] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, [5, 8]] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, 7] = 0
-        # Row 6 (R's row 7)
-        DC_Dt[6, 0] = 48 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[6, 1] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[6, [2, 3, 4, 5]] = -16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[6, [6, 8]] = 16 * m ** 2 * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[6, 7] = 0
-        # Row 7 (R's row 8)
-        DC_Dt[7, 0] = 96 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[7, [1, 2, 4]] = -32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[7, [3, 5, 6]] = 32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[7, 7] = 0
-        DC_Dt[7, 8] = 32 * m ** 2 * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        # Row 8 (R's row 9)
-        DC_Dt[8, 0] = 12 * m ** 2 * (
-                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
-                    + 4 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, [1, 2]] = -4 * m ** 2 * (
-                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
-                    + 4 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
-                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, 3] = 2 * m ** 2 * (
-                    2 * mt * (3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                3 * mt ** 7 + 27 * mt ** 6 + 85 * mt ** 5 + 75 * mt ** 4 - 166 * mt ** 3 - 462 * mt ** 2 - 414 * mt - 132)
-                    - 8 * (
-                                3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, 4] = 4 * m ** 2 * (16 * (10 * mt ** 5 + 75 * mt ** 4 + 185 * mt ** 3 + 129 * mt ** 2 - 99 * mt - 120)
-                                    + 48 * (
-                                                mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
-                                    + mt * (
-                                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, [5, 6]] = 4 * m ** 2 * (
-                    24 * (mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
-                    + mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, 7] = -2 * m ** 2 * (
-                    4 * (3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)
-                    - 2 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[8, 8] = 4 * (m ** 3) * t * (
-                    3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-
-        # Compute output first and second derivatives
-        # First derivatives of tau's
-        delta_t1 = np.array([0, -2 * m, 0, -2 * m, 0, -m, 0, -m, 2 / t])
-        dp_dt1 = (W_s @ C.T @ (delta_t1 * beta)).T
-        delta_t2 = np.array([0, 0, -2 * m, -2 * m, 0, 0, -m, -m, 2 / t])
-        dp_dt2 = (W_s @ C.T @ (delta_t2 * beta)).T
-        delta_t3 = np.array([0, 0, 0, 0, -2 * m, -2 * m, -2 * m, -2 * m, -4 * (m + 1 / t)])
-        dp_dt3 = (W_s @ C.T @ (delta_t3 * beta)).T
-
-        # First derivatives of theta
-        delta_t = np.array([0, 0, 0, 0, 0, 0, 0, 0, (4 * t3 - 2 * (t1 + t2)) / (t ** 2)])
-        dp_dt = W_s @ ((C.T @ (2 * delta_t * beta)).T + 2 * dC_dt.T @ np.matrix(beta).T)
-
-        # First derivatives of gamma's
-        dGt_dg = np.matrix(get_gamma_1st_deriv(gamma_parameters, gi))  # ∂Γ_t / ∂γ_i for i in gamma_id
-        dGt_dg_p = p_Qt @ dGt_dg
-
-        # ------ First derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] ------
-        r = gi.size
-        columns = [Gamma_t * dp_dt1, Gamma_t * dp_dt2, Gamma_t * dp_dt3, Gamma_t * dp_dt]
-        if r > 0: # Add the derivatives w.r.t. gamma's if r>0
-            columns.append(dGt_dg_p)
-        first_deriv = Omega @ np.hstack(columns)
-        # -------------------------------------------------------------------
-
-        # Second derivatives of tau's
-        dp_dt1t1 = (W_s @ C.T @ (delta_t1 * delta_t1 * beta)).T
-        dp_dt1t2 = (W_s @ C.T @ (delta_t1 * delta_t2 * beta)).T
-        dp_dt1t3 = (W_s @ C.T @ (delta_t1 * delta_t3 * beta)).T
-        dp_dt2t2 = (W_s @ C.T @ (delta_t2 * delta_t2 * beta)).T
-        dp_dt2t3 = (W_s @ C.T @ (delta_t2 * delta_t3 * beta)).T
-        dp_dt3t3 = (W_s @ C.T @ (delta_t3 * delta_t3 * beta)).T
-
-        # Second derivatives of tau & theta
-        delta_t1t = delta_t2t = np.array([0, 0, 0, 0, 0, 0, 0, 0, -2 * (t + 2 * t1 + 2 * t2 - 4 * t3) / (t ** 3)])
-        delta_t3t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 4 * (t + (2 * t1 + 2 * t2 - 4 * t3) * (1 + m * t)) / (t ** 3)])
-        dp_dt1t = W_s @ ((C.T @ (2 * delta_t1t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t1 * beta).T)
-        dp_dt2t = W_s @ ((C.T @ (2 * delta_t2t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t2 * beta).T)
-        dp_dt3t = W_s @ ((C.T @ (2 * delta_t3t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t3 * beta).T)
-
-        # Second derivatives of tau & gamma
-        dGt_dg_dp_dt1 = dp_dt1 @ dGt_dg
-        dGt_dg_dp_dt2 = dp_dt2 @ dGt_dg
-        dGt_dg_dp_dt3 = dp_dt3 @ dGt_dg
-
-        # Second derivatives of theta
-        delta_tt = np.array([0, 0, 0, 0, 0, 0, 0, 0, 4 * (t1 + t2 - 2 * t3) * (t + t1 + t2 - 2 * t3) / (t ** 4)])
-        dp_dtt = W_s @ ((4 * C.T @ (delta_tt * beta)).T + 8 * dC_dt.T @ np.matrix(
-            delta_t * beta).T + 4 * DC_Dt.T @ np.matrix(beta).T)
-
-        # Second derivatives of theta & gamma
-        dGt_dg_dp_dt = dp_dt @ dGt_dg
-
-        # Second derivatives of gamma's
-        dGt_dgg = get_gamma_2nd_deriv(gamma_parameters, gi)  # ∂²Γ_t / (∂γ_i ∂γ_j) for i,j in gamma_id
-        # dGt_dgg_p[i,j] = p_Qt * dGt_dgg[i, j] would be a 3D matrix with shape (r, r, 15)
-
-        # ------ Second derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] ------
-        second_deriv = np.zeros((4+r, 4+r, 15))
-        second_deriv[0, 0, :] = (Gamma_t * Omega @ dp_dt1t1).flatten()
-        second_deriv[0, 1, :] = (Gamma_t * Omega @ dp_dt1t2).flatten()
-        second_deriv[0, 2, :] = (Gamma_t * Omega @ dp_dt1t3).flatten()
-        second_deriv[0, 3, :] = (Gamma_t * Omega @ dp_dt1t).flatten()
-        second_deriv[1, 1, :] = (Gamma_t * Omega @ dp_dt2t2).flatten()
-        second_deriv[1, 2, :] = (Gamma_t * Omega @ dp_dt2t3).flatten()
-        second_deriv[1, 3, :] = (Gamma_t * Omega @ dp_dt2t).flatten()
-        second_deriv[2, 2, :] = (Gamma_t * Omega @ dp_dt3t3).flatten()
-        second_deriv[2, 3, :] = (Gamma_t * Omega @ dp_dt3t).flatten()
-        second_deriv[3, 3, :] = (Gamma_t * Omega @ dp_dtt).flatten()
-        # Add the derivatives w.r.t. gamma's if r>0
-        if r > 0:
-            for i in range(r):
-                gamma_idx = 4 + i  # This shifts the index to start at 4
-
-                second_deriv[0, gamma_idx, :] = (Omega @ dGt_dg_dp_dt1[:, i]).flatten()
-                second_deriv[1, gamma_idx, :] = (Omega @ dGt_dg_dp_dt2[:, i]).flatten()
-                second_deriv[2, gamma_idx, :] = (Omega @ dGt_dg_dp_dt3[:, i]).flatten()
-                second_deriv[3, gamma_idx, :] = (Omega @ dGt_dg_dp_dt[:, i]).flatten()
-                second_deriv[gamma_idx, gamma_idx, :] = (Omega @ p_Qt * dGt_dgg[i, i]).flatten()
-                # Cross-derivatives between different gammas
-                for j in range(i + 1, r):
-                    gamma_jdx = 4 + j
-                    second_deriv[gamma_idx, gamma_jdx, :] = (Omega @ p_Qt * dGt_dgg[i, j]).flatten()
-        # Mirror the upper triangle to the lower triangle across all 15 slices
-        for i in range(4 + r):
-            for j in range(i + 1, 4 + r):
-                second_deriv[j, i, :] = second_deriv[i, j, :]
-        # ---------------------------------------------------------------------------
-
-        # ---- Output ----
-        # first_deriv: first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
-        # second_deriv: second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is symmetric
-        # ----------------
-        return first_deriv, second_deriv
-
-    def Qt_1st_2nd_deriv_Asymm(tree_parameters, gamma_parameters, pi, tp, gi):
-        """(pi = param_idx, ia = is_asymm, tp = taxa_perm, gi = gamma_id)
-        For Q_t with len(gamma_id) = r, the length of parameters for this Q_t is 3 + 1 + r (tau's + theta + gamma's).
-        Get the first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}], and
-        get the second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric."""
-
-        # Prepare quartet parameters used to compute site pattern probabilities
-        t1, t2, t3, theta_tilde = get_tau_theta(tree_parameters, pi)
-        t = 2 * theta_tilde  # 2*theta.tilde
-        m = 4 / 3  # mu for JC69
-
-        # 15-categ TrueProbs of quartet Q_t pulled from D_t
-        p_Qt = np.matrix(getTrueProbsAsymm(t1, t2, t3, theta_tilde, m)).T
-        # get gamma weight for Q_t (Gamma_t)
-        Gamma_t = get_gamma_weight(gamma_parameters, gi)
-        # Get 15 category permutation matrix (Ω_t)
-        Omega = get_site_pattern_map_matrix(tp)
-
-        # Our goal: (i) first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric and
-        # (ii) second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
-        # We need: 1) beta vector, 2) W_s weight matrix, 3) C coefficient matrix, 4) dC/d(theta) 1st order derivative of
-        # the C coefficient matrix w.r.t. theta, 5) DC/D(theta) 2nd order derivative the C coefficient matrix w.r.t. theta
-
-        # 1) beta vector
-        beta = np.array([1, np.exp(-2 * m * t1), np.exp(-2 * m * t2), np.exp(-m * t1 - 2 * m * t2), np.exp(-2 * m * t3),
-                         np.exp(-m * t1 - 2 * m * t3),
-                         np.exp(-2 * m * t1 - 2 * m * t3), np.exp(-m * t2 - 2 * m * t3),
-                         np.exp(-m * t1 - m * t2 - 2 * m * t3), np.exp((t1 - t2) * 2 / t - 2 * m * (t2 + t3))])
-
-        # 2) W_a weight matrix
-        W_a = np.matrix([[4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 12, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 24, 0],
-                         [0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0],
-                         [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]])
-
-        # 3) C coefficient matrix
-        C = np.matrix(np.zeros((10, 11)))
-        # Row 0 (R's row 1)
-        C[0, :] = 1 / 256
-        # Row 1 (R's row 2)
-        C[1, [0, 2, 3, 4, 7]] = 3 / (256 * (1 + m * t))
-        C[1, [1, 5, 6, 8, 9, 10]] = -1 / (256 * (1 + m * t))
-        # Row 2 (R's row 3)
-        C[2, [0, 3]] = 6 / (256 * (1 + m * t))
-        C[2, [1, 5, 9]] = 2 / (256 * (1 + m * t))
-        C[2, [2, 4, 6, 7, 8, 10]] = -2 / (256 * (1 + m * t))
-        # Row 3 (R's row 4)
-        C[3, [0, 3]] = 12 / (256 * (1 + m * t) * (2 + m * t))
-        C[3, [1, 2, 4, 5, 7, 9]] = -4 / (256 * (1 + m * t) * (2 + m * t))
-        C[3, [6, 8, 10]] = 4 / (256 * (1 + m * t) * (2 + m * t))
-        # Row 4 (R's row 5)
-        C[4, 0] = 9 / (256 * (1 + m * t))
-        C[4, [1, 2]] = 5 / (256 * (1 + m * t))
-        C[4, [3, 7, 9, 10]] = -3 / (256 * (1 + m * t))
-        C[4, [4, 5, 6, 8]] = 1 / (256 * (1 + m * t))
-        # Row 5 (R's row 6)
-        C[5, [0, 2]] = 12 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, [1, 3, 4, 5, 7, 8]] = -4 / (256 * (1 + m * t) * (2 + m * t))
-        C[5, [6, 9, 10]] = 4 / (256 * (1 + m * t) * (2 + m * t))
-        # Row 6 (R's row 7)
-        C[6, [0, 4]] = 9 / (256 * (1 + m * t) ** 2)
-        C[6, [1, 2, 3, 6, 7]] = -3 / (256 * (1 + m * t) ** 2)
-        C[6, [5, 8, 9, 10]] = 1 / (256 * (1 + m * t) ** 2)
-        # Row 7 (R's row 8)
-        C[7, 0] = 24 / (256 * (1 + m * t) * (2 + m * t))
-        C[7, 1] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[7, [2, 3, 4, 5, 6]] = -8 / (256 * (1 + m * t) * (2 + m * t))
-        C[7, [7, 10]] = 8 / (256 * (1 + m * t) * (2 + m * t))
-        C[7, [8, 9]] = 0
-        # Row 8 (R's row 9)
-        C[8, 0] = 48 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[8, [1, 2, 3, 4]] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[8, [5, 6, 7]] = 16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        C[8, [8, 9]] = 0
-        C[8, 10] = -16 / (256 * (1 + m * t) * (2 + m * t) ** 2)
-        # Row 9 (R's row 10)
-        C[9, 0] = (6 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (
-                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, [1, 2, 3]] = -(2 * m * t * (4 + m * t) * (4 + 3 * m * t)) / (
-                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, 4] = (2 * m * t * (4 + m * t) ** 2) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, 5] = m * t * (2 * 16 + 40 * m * t + 10 * (m ** 2) * (t ** 2)) / (
-                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, [6, 7]] = 2 * (m ** 2) * (t ** 2) * (4 + m * t) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, [8, 9]] = -(m ** 2) * (t ** 2) * (4 + 2 * m * t) / (
-                    256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-        C[9, 10] = 2 * (m ** 3) * (t ** 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2 * (3 + m * t))
-
-        # 4) dC/d(theta)
-        mt = m * t  # for ease of notation
-        dC_dt = np.matrix(np.zeros((10, 11)))
-        # Row 0 (R's row 1)
-        dC_dt[0, :] = 0
-        # Row 1 (R's row 2)
-        dC_dt[1, [0, 2, 3, 4, 7]] = -3 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[1, [1, 5, 6, 8, 9, 10]] = m / (256 * (1 + m * t) ** 2)
-        # Row 2 (R's row 3)
-        dC_dt[2, [0, 3]] = -6 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[2, [1, 5, 9]] = -2 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[2, [2, 4, 6, 7, 8, 10]] = 2 * m / (256 * (1 + m * t) ** 2)
-        # Row 3 (R's row 4)
-        dC_dt[3, [0, 3]] = -12 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[3, [1, 2, 4, 5, 7, 9]] = 4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[3, [6, 8, 10]] = -4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        # Row 4 (R's row 5)
-        dC_dt[4, 0] = -9 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, [1, 2]] = -5 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, [3, 7, 9, 10]] = 3 * m / (256 * (1 + m * t) ** 2)
-        dC_dt[4, [4, 5, 6, 8]] = -1 * m / (256 * (1 + m * t) ** 2)
-        # Row 5 (R's row 6)
-        dC_dt[5, [0, 2]] = -12 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, [1, 3, 4, 5, 7, 8]] = 4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[5, [6, 9, 10]] = -4 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        # Row 6 (R's row 7)
-        dC_dt[6, [0, 4]] = -18 * m / (256 * (1 + m * t) ** 3)
-        dC_dt[6, [1, 2, 3, 6, 7]] = 6 * m / (256 * (1 + m * t) ** 3)
-        dC_dt[6, [5, 8, 9, 10]] = -2 * m / (256 * (1 + m * t) ** 3)
-        # Row 7 (R's row 8)
-        dC_dt[7, 0] = -24 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[7, 1] = -8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[7, [2, 3, 4, 5, 6]] = 8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[7, [7, 10]] = -8 * m * (2 * mt + 3) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 2)
-        dC_dt[7, [8, 9]] = 0
-        # Row 8 (R's row 9)
-        dC_dt[8, 0] = -48 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[8, [1, 2, 3, 4]] = 16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[8, [5, 6, 7]] = -16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        dC_dt[8, [8, 9]] = 0
-        dC_dt[8, 10] = 16 * m * (3 * mt + 4) / (256 * (1 + m * t) ** 2 * (2 + m * t) ** 3)
-        # Row 9 (R's row 10)
-        dC_dt[9, 0] = -6 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
-                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
-                                + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, [1, 2, 3]] = 2 * m * (mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * mt ** 2 * (
-                    2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18)
-                                       + 16 * (3 * mt ** 4 + 13 * mt ** 3 + 13 * mt ** 2 - 3 * mt - 6)) / (
-                                      256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, 4] = -2 * m * (mt ** 2 * (2 * mt ** 3 + 3 * mt ** 2 - 13 * mt - 18) + 8 * mt * (
-                    3 * mt ** 3 + 9 * mt ** 2 - 2 * mt - 12)
-                                + 16 * (4 * mt ** 3 + 15 * mt ** 2 + 9 * mt - 6)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, 5] = m * (2 * mt ** 2 * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 8 * mt * (
-                    2 * mt ** 4 + 6 * mt ** 3 - 4 * mt ** 2 - 20 * mt - 12)
-                           + 16 * (-2 * mt ** 5 - 12 * mt ** 4 - 22 * mt ** 3 - 6 * mt ** 2 + 18 * mt + 12)) / (
-                              256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, [6, 7]] = 2 * (m ** 2) * t * (4 * (-3 * mt ** 3 - 9 * mt ** 2 + 2 * mt + 12) + mt * (
-                    -2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18)) / (
-                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, [8, 9]] = 2 * (m ** 2) * t * (mt * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) + 4 * (
-                    mt ** 4 + 3 * mt ** 3 - 2 * mt ** 2 - 10 * mt - 6)) / (
-                                   256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-        dC_dt[9, 10] = 2 * (m ** 3) * (t ** 2) * (-2 * mt ** 3 - 3 * mt ** 2 + 13 * mt + 18) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3 * (3 + m * t) ** 2)
-
-        # 5) DC/D(theta) 2nd order derivative
-        mt = m * t  # for ease of notation
-        DC_Dt = np.matrix(np.zeros((10, 11)))
-        # Row 0 (R's row 1)
-        DC_Dt[0, :] = 0
-        # Row 1 (R's row 2)
-        DC_Dt[1, [0, 2, 3, 4, 7]] = 3 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[1, [1, 5, 6, 8, 9, 10]] = -1 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        # Row 2 (R's row 3)
-        DC_Dt[2, [0, 3]] = 6 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[2, [1, 5, 9]] = 2 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[2, [2, 4, 6, 7, 8, 10]] = -2 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        # Row 3 (R's row 4)
-        DC_Dt[3, [0, 3]] = 12 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[3, [1, 2, 4, 5, 7, 9]] = -4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[3, [6, 8, 10]] = 4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        # Row 4 (R's row 5)
-        DC_Dt[4, 0] = 9 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, [1, 2]] = 5 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, [3, 7, 9, 10]] = -3 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        DC_Dt[4, [4, 5, 6, 8]] = 1 * 2 * m ** 2 / (256 * (1 + m * t) ** 3)
-        # Row 5 (R's row 6)
-        DC_Dt[5, [0, 2]] = 12 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, [1, 3, 4, 5, 7, 8]] = -4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[5, [6, 9, 10]] = 4 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        # Row 6 (R's row 7)
-        DC_Dt[6, [0, 4]] = 9 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
-        DC_Dt[6, [1, 2, 3, 6, 7]] = -3 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
-        DC_Dt[6, [5, 8, 9, 10]] = 1 * 6 * m ** 2 / (256 * (1 + m * t) ** 4)
-        # Row 7 (R's row 8)
-        DC_Dt[7, 0] = 24 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[7, 1] = 8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[7, [2, 3, 4, 5, 6]] = -8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[7, [7, 10]] = 8 * 2 * (m ** 2) * (3 * mt ** 2 + 9 * mt + 7) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 3)
-        DC_Dt[7, [8, 9]] = 0
-        # Row 8 (R's row 9)
-        DC_Dt[8, 0] = 48 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[8, [1, 2, 3, 4]] = -16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[8, [5, 6, 7]] = 16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (
-                    256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        DC_Dt[8, [8, 9]] = 0
-        DC_Dt[8, 10] = -16 * 2 * (m ** 2) * (6 * mt ** 2 + 16 * mt + 11) / (256 * (1 + m * t) ** 3 * (2 + m * t) ** 4)
-        # Row 9 (R's row 10)
-        DC_Dt[9, 0] = 12 * m ** 2 * (
-                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
-                    + 4 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, [1, 2, 3]] = -4 * m ** 2 * (
-                    mt * (-3 * mt ** 6 - 9 * mt ** 5 + 43 * mt ** 4 + 201 * mt ** 3 + 212 * mt ** 2 - 36 * mt - 108)
-                    + 4 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                6 * mt ** 6 + 46 * mt ** 5 + 117 * mt ** 4 + 77 * mt ** 3 - 123 * mt ** 2 - 207 * mt - 84)) / (
-                                      256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, 4] = 4 * m ** 2 * (16 * (10 * mt ** 5 + 75 * mt ** 4 + 185 * mt ** 3 + 129 * mt ** 2 - 99 * mt - 120)
-                                    + 48 * (
-                                                mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
-                                    + mt * (
-                                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, 5] = 2 * m ** 2 * (
-                    2 * mt * (3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)
-                    + 16 * (
-                                3 * mt ** 7 + 27 * mt ** 6 + 85 * mt ** 5 + 75 * mt ** 4 - 166 * mt ** 3 - 462 * mt ** 2 - 414 * mt - 132)
-                    - 8 * (
-                                3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)) / (
-                              256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, [6, 7]] = 4 * m ** 2 * (
-                    24 * (mt ** 6 + 6 * mt ** 5 + 7 * mt ** 4 - 18 * mt ** 3 - 42 * mt ** 2 - 18 * mt + 6)
-                    + mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, [8, 9]] = -2 * m ** 2 * (
-                    4 * (3 * mt ** 7 + 15 * mt ** 6 - 7 * mt ** 5 - 159 * mt ** 4 - 320 * mt ** 3 - 216 * mt ** 2 + 36)
-                    - 2 * mt * (
-                                3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108)) / (
-                                   256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-        DC_Dt[9, 10] = 4 * (m ** 3) * t * (
-                    3 * mt ** 6 + 9 * mt ** 5 - 43 * mt ** 4 - 201 * mt ** 3 - 212 * mt ** 2 + 36 * mt + 108) / (
-                               256 * (1 + m * t) ** 4 * (2 + m * t) ** 4 * (3 + m * t) ** 3)
-
-        # Compute output first and second derivatives
-        # First derivatives of tau's
-        delta_t1 = np.array([0, -2 * m, 0, -m, 0, -m, -2 * m, 0, -m, 2 / t])
-        dp_dt1 = (W_a @ C.T @ (delta_t1 * beta)).T
-        delta_t2 = np.array([0, 0, -2 * m, -2 * m, 0, 0, 0, -m, -m, -2 * (m + 1 / t)])
-        dp_dt2 = (W_a @ C.T @ (delta_t2 * beta)).T
-        delta_t3 = np.array([0, 0, 0, 0, -2 * m, -2 * m, -2 * m, -2 * m, -2 * m, -2 * m])
-        dp_dt3 = (W_a @ C.T @ (delta_t3 * beta)).T
-
-        # First derivatives of theta
-        delta_t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 2 * (t2 - t1) / (t ** 2)])
-        dp_dt = W_a @ ((C.T @ (2 * delta_t * beta)).T + 2 * dC_dt.T @ np.matrix(beta).T)
-
-        # First derivatives of gamma's
-        dGt_dg = np.matrix(get_gamma_1st_deriv(gamma_parameters, gi))  # ∂Γ_t / ∂γ_i for i in gamma_id
-        dGt_dg_p = p_Qt @ dGt_dg
-
-        # ------ First derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] ------
-        r = gi.size
-        columns = [Gamma_t * dp_dt1, Gamma_t * dp_dt2, Gamma_t * dp_dt3, Gamma_t * dp_dt]
-        if r > 0:  # Add the derivatives w.r.t. gamma's if r>0
-            columns.append(dGt_dg_p)
-        first_deriv = Omega @ np.hstack(columns)
-        # -------------------------------------------------------------------
-
-        # Second derivatives of tau's
-        dp_dt1t1 = (W_a @ C.T @ (delta_t1 * delta_t1 * beta)).T
-        dp_dt1t2 = (W_a @ C.T @ (delta_t1 * delta_t2 * beta)).T
-        dp_dt1t3 = (W_a @ C.T @ (delta_t1 * delta_t3 * beta)).T
-        dp_dt2t2 = (W_a @ C.T @ (delta_t2 * delta_t2 * beta)).T
-        dp_dt2t3 = (W_a @ C.T @ (delta_t2 * delta_t3 * beta)).T
-        dp_dt3t3 = (W_a @ C.T @ (delta_t3 * delta_t3 * beta)).T
-
-        # Second derivatives of tau & theta
-        delta_t1t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, -2 * (t + 2 * t1 - 2 * t2) / (t ** 3)])
-        delta_t2t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 2 * (t + 2 * (1 + mt) * (t1 - t2)) / (t ** 3)])
-        delta_t3t = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4 * m * (t1 - t2) / (t ** 2)])
-        dp_dt1t = W_a @ ((C.T @ (2 * delta_t1t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t1 * beta).T)
-        dp_dt2t = W_a @ ((C.T @ (2 * delta_t2t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t2 * beta).T)
-        dp_dt3t = W_a @ ((C.T @ (2 * delta_t3t * beta)).T + 2 * dC_dt.T @ np.matrix(delta_t3 * beta).T)
-
-        # Second derivatives of tau & gamma
-        dGt_dg_dp_dt1 = dp_dt1 @ dGt_dg
-        dGt_dg_dp_dt2 = dp_dt2 @ dGt_dg
-        dGt_dg_dp_dt3 = dp_dt3 @ dGt_dg
-
-        # Second derivatives of theta
-        delta_tt = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 4 * (t1 - t2) * (t + t1 - t2) / (t ** 4)])
-        dp_dtt = W_a @ ((4 * C.T @ (delta_tt * beta)).T + 8 * dC_dt.T @ np.matrix(
-            delta_t * beta).T + 4 * DC_Dt.T @ np.matrix(beta).T)
-
-        # Second derivatives of theta & gamma
-        dGt_dg_dp_dt = dp_dt @ dGt_dg
-
-        # Second derivatives of gamma's
-        dGt_dgg = get_gamma_2nd_deriv(gamma_parameters, gi)  # ∂²Γ_t / (∂γ_i ∂γ_j) for i,j in gamma_id
-        # dGt_dgg_p[i,j] = p_Qt * dGt_dgg[i, j] would be a 3D matrix with shape (r, r, 15)
-
-        # ------ Second derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] ------
-        second_deriv = np.zeros((4 + r, 4 + r, 15))
-        second_deriv[0, 0, :] = (Gamma_t * Omega @ dp_dt1t1).flatten()
-        second_deriv[0, 1, :] = (Gamma_t * Omega @ dp_dt1t2).flatten()
-        second_deriv[0, 2, :] = (Gamma_t * Omega @ dp_dt1t3).flatten()
-        second_deriv[0, 3, :] = (Gamma_t * Omega @ dp_dt1t).flatten()
-        second_deriv[1, 1, :] = (Gamma_t * Omega @ dp_dt2t2).flatten()
-        second_deriv[1, 2, :] = (Gamma_t * Omega @ dp_dt2t3).flatten()
-        second_deriv[1, 3, :] = (Gamma_t * Omega @ dp_dt2t).flatten()
-        second_deriv[2, 2, :] = (Gamma_t * Omega @ dp_dt3t3).flatten()
-        second_deriv[2, 3, :] = (Gamma_t * Omega @ dp_dt3t).flatten()
-        second_deriv[3, 3, :] = (Gamma_t * Omega @ dp_dtt).flatten()
-        # Add the derivatives w.r.t. gamma's if r>0
-        if r > 0:
-            for i in range(r):
-                gamma_idx = 4 + i  # This shifts the index to start at 4
-
-                second_deriv[0, gamma_idx, :] = (Omega @ dGt_dg_dp_dt1[:, i]).flatten()
-                second_deriv[1, gamma_idx, :] = (Omega @ dGt_dg_dp_dt2[:, i]).flatten()
-                second_deriv[2, gamma_idx, :] = (Omega @ dGt_dg_dp_dt3[:, i]).flatten()
-                second_deriv[3, gamma_idx, :] = (Omega @ dGt_dg_dp_dt[:, i]).flatten()
-                second_deriv[gamma_idx, gamma_idx, :] = (Omega @ p_Qt * dGt_dgg[i, i]).flatten()
-                # Cross-derivatives between different gammas
-                for j in range(i + 1, r):
-                    gamma_jdx = 4 + j
-                    second_deriv[gamma_idx, gamma_jdx, :] = (Omega @ p_Qt * dGt_dgg[i, j]).flatten()
-        # Mirror the upper triangle to the lower triangle across all 15 slices
-        for i in range(4 + r):
-            for j in range(i + 1, 4 + r):
-                second_deriv[j, i, :] = second_deriv[i, j, :]
-        # ---------------------------------------------------------------------------
-
-        # ---- Output ----
-        # first_deriv: first order derivatives 15x(4+r) of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
-        # second_deriv: second order derivatives (4+r)x(4+r)x15 of [Γ_t * Ω_t @ p_{D^Q_t}] when Qt is asymmetric
-        # ----------------
-        return first_deriv, second_deriv
-
-    # ---- Step 2: Get the first and second derivatives of p_Q ----
-    # Get parameters, gamma_weights and true site pattern probs
-    num_param = len(parameters)
-    h = gamma_id[0].size            # get the number of hybridizations
-    tree_parameters = parameters[:-h]
-    J = len(tree_parameters) - 1    # number of tau's
-    gamma_parameters = parameters[-h:]
-    Q_param_idx = set()
-
-    # Create zero matrices for summation.
-    firstDer_p_Q = np.zeros((15, num_param))
-    secondDer_p_Q = np.zeros((num_param, num_param, 15))
-
-    # Remove common gamma indices in gamma_id for the ease of taking derivative of Gamma_t
-    gamma_id_clean = remove_common_elements(gamma_id)
-
-    # Take derivatives of quartet (pi = param_idx, ia = is_asymm, tp = taxa_perm, gi = gamma_id)
-    for pi, ia, tp, gi in zip(param_idx, is_asymm, taxa_perm, gamma_id_clean):
-        # Get the first and second derivatives of [Γ_t * Ω_t @ p_{D^Q_t}] by Symm or Asymm
-        firstDer_Qt, secondDer_Qt = (Qt_1st_2nd_deriv_Asymm if ia
-                                     else Qt_1st_2nd_deriv_Symm)(tree_parameters, gamma_parameters, pi, tp, gi)
-
-        # Get all indices of the tau's, theta, gamma's of this D^Q_t quartet
-        # pi reversed because tau_id in Qt_1st_2nd_deriv*() is [t1,t2,t3] but pi is [t3,t2,t1]
-        tau_idx = J - pi[::-1]      # Convert to 0-based indices for tau.
-        theta_idx = [J]             # Convert to 0-based indices for theta
-        if gi.size > 0:
-            gamma_idx = J + np.abs(gi)     # Convert to 0-based indices for gamma
-            Qt_param_idx = np.concatenate((tau_idx, theta_idx, gamma_idx))
-        else:
-            Qt_param_idx = np.concatenate((tau_idx, theta_idx))
-        Q_param_idx.update(Qt_param_idx)
-
-        # Accumulate to firstDer_p_Q by Qt_param_idx
-        firstDer_p_Q[:, Qt_param_idx] += firstDer_Qt
-
-        # Accumulate to secondDer_p_Q by Qt_param_idx
-        row_idx, col_idx = np.ix_(Qt_param_idx, Qt_param_idx)
-        secondDer_p_Q[row_idx, col_idx, :] += secondDer_Qt
-
-    # ---- Step 3: get the gradient and Hessian of this quartet subnetwork ----
-    p_Q = getTrueProbsQuartet(parameters, param_idx, is_asymm, taxa_perm, gamma_id)
-    # R_Q matrix = gradient vector of log(p_Q)
-    R_Q_mat = firstDer_p_Q.T / p_Q
-
-    n_Q_div_p2_Q = n_Q / np.square(p_Q)     # shape (15,)
-    n_Q_div_p_Q = n_Q / p_Q                 # shape (15,)
-    # H_Q matrix = Hessian matrix of l(Q)
-    H_Q_mat = (n_Q_div_p2_Q * firstDer_p_Q.T) @ firstDer_p_Q - secondDer_p_Q @ n_Q_div_p_Q
-    return R_Q_mat, H_Q_mat
-
-
-def get_Vari_Sens_Mat(parameters, zipped_data_net, all_E_mat, n_D):
-    """Get the composite score function (U_c), the variability matrix (J_mat) and
-    the sensitivity matrix (H_mat) of the composite likelihood of network."""
-
-    # -------------------------------------------------------------------------
-    # 1. Precompute parameter size and create zero matrices for summation
-    # -------------------------------------------------------------------------
-    num_param = len(parameters)        # Number of parameters
-
-    # sum_RE is sum of R_Q_mat @ E_Q_mat over all quartet Q where R_Q_mat is deriv of log(p) for quartet Q,
-    # E_Q_mat is a map matrix that n_Q = E_Q_mat @ n_D. H_mat is the sensitivity matrix
-    sum_RE = np.matrix(np.zeros((num_param, len(n_D))))
-    H_mat = np.matrix(np.zeros((num_param, num_param)))
-
-    # -------------------------------------------------------------------------
-    # 2. Compute variability matrix J_mat and sensitivity matrix H_mat
-    # -------------------------------------------------------------------------
-    for (n_Q, param_idx, is_asymm, taxa_perm, gamma_id), E_Q_mat in zip(zipped_data_net, all_E_mat):
-        # Get R_Q_mat, H_Q_mat from quartet Q
-        R_Q_mat, H_Q_mat = get_Grad_Hess_Quartet(parameters, n_Q, param_idx, is_asymm, taxa_perm, gamma_id)
-
-        # Accumulate R_Q_mat @ E_Q_mat of each quartet Q to sum_RE, and accumulate H_Q_mat to H_mat
-        sum_RE += R_Q_mat @ E_Q_mat
-        H_mat += H_Q_mat
-
-    # Get the empirical variance to calculate the variability matrix
-    empirical_var = np.diag(n_D) - np.outer(n_D,n_D) / n_D.sum()
-    J_mat = sum_RE @ empirical_var @ sum_RE.T
-    # U_c = sum_RE @ n_D
-
-    return J_mat, H_mat
-
-
-def get_Score_Vari_Sens_Mat(parameters, zipped_data_net, all_E_mat, n_D):
-    """Get the composite score function (U_c), the variability matrix (J_mat) and
-    the sensitivity matrix (H_mat) of the composite likelihood of network."""
-
-    # -------------------------------------------------------------------------
-    # 1. Precompute parameter size and create zero matrices for summation
-    # -------------------------------------------------------------------------
-    num_param = len(parameters)        # Number of parameters
-
-    # sum_RE is sum of R_Q_mat @ E_Q_mat over all quartet Q where R_Q_mat is deriv of log(p) for quartet Q,
-    # E_Q_mat is a map matrix that n_Q = E_Q_mat @ n_D. H_mat is the sensitivity matrix
-    sum_RE = np.matrix(np.zeros((num_param, len(n_D))))
-    H_mat = np.matrix(np.zeros((num_param, num_param)))
-
-    # -------------------------------------------------------------------------
-    # 2. Compute variability matrix J_mat and sensitivity matrix H_mat
-    # -------------------------------------------------------------------------
-    for (n_Q, param_idx, is_asymm, taxa_perm, gamma_id), E_Q_mat in zip(zipped_data_net, all_E_mat):
-        # Get R_Q_mat, H_Q_mat from quartet Q
-        R_Q_mat, H_Q_mat = get_Grad_Hess_Quartet(parameters, n_Q, param_idx, is_asymm, taxa_perm, gamma_id)
-
-        # Accumulate R_Q_mat @ E_Q_mat of each quartet Q to sum_RE, and accumulate H_Q_mat to H_mat
-        sum_RE += R_Q_mat @ E_Q_mat
-        H_mat += H_Q_mat
-
-    # Get the empirical variance to calculate the variability matrix
-    empirical_var = np.diag(n_D) - np.outer(n_D,n_D) / n_D.sum()
-    J_mat = sum_RE @ empirical_var @ sum_RE.T
-    U_c = (sum_RE @ n_D).T
-
-    return U_c, J_mat, H_mat
-
-
-def get_curvAdjust_matrix(MCLE, zipped_data_net, all_E_mat, n_D):
-    """Use J_mat and H_mat derived from get_Vari_Sens_Mat() to get curvature adjustment matrix.
-    Use zipped_data_net from get_parsed_data_net()."""
-    import numpy as np
-
-    J_mat, H_mat = get_Vari_Sens_Mat(MCLE, zipped_data_net, all_E_mat, n_D)
-
-    def compute_M_inv(H_mat):
-        U, D, _ = np.linalg.svd(H_mat)
-        return U @ np.diag(D ** (-1/2)) @ U.T
-
-    def compute_M_A(H_mat, J_mat):
-        Godambe_mat = H_mat @ np.linalg.inv(J_mat) @ H_mat
-        U, D, _ = np.linalg.svd(Godambe_mat)
-        return U @ np.diag(np.sqrt(D)) @ U.T
-
-    M_inv = compute_M_inv(H_mat)
-    M_A = compute_M_A(H_mat, J_mat)
-    curv_adj_mat = M_inv @ M_A
-
-    return curv_adj_mat
+class CurvatureAdjustmentCalculator:
+    """Finds curvature adjustment matrix C for network composite likelihood"""
+
+    def __init__(self, mcle_net_params: NetworkParameters,
+                 all_quartet_data: list[QuartetData,...],
+                 full_site_pattern: FullSitePatterns):
+        self.network_parameters = mcle_net_params
+        self.all_quartet_data = all_quartet_data
+        self.n_D = full_site_pattern.n_D
+        # Get the empirical variance to calculate the variability matrix
+        self.empir_var = np.diag(self.n_D) - np.outer(self.n_D, self.n_D) / self.n_D.sum()
+        # Basic dimensions
+        self.num_retic = self.network_parameters.num_retic
+        self.num_tau = self.network_parameters.num_tau
+        self.total_params = self.num_tau + 1 + self.num_retic  # tau's + theta + gamma's
+        # Precompute sum_RE matrix for computing score function and variability matrix, and H_mat
+        self.sum_RE, self.H_mat = self._precompute_sum_RE_sens_mat()
+
+    def _precompute_sum_RE_sens_mat(self):
+        """Precompute sum_RE matrix, the sum of R_Q_mat @ E_Q_mat over all quartet Q where
+        R_Q_mat is deriv of log(p) for quartet Q, and E_Q_mat is a map matrix that n_Q = E_Q_mat @ n_D.
+        H_mat is the sensitivity matrix"""
+        num_param = self.total_params      # Number of parameters
+        n_D = self.n_D
+
+        sum_RE = np.matrix(np.zeros((num_param, len(n_D))))
+        H_mat = np.matrix(np.zeros((num_param, num_param)))
+
+        for q_data in self.all_quartet_data:
+            # Get R_Q_mat, H_Q_mat from quartet Q
+            R_Q_mat, H_Q_mat = q_data.get_grad_hess_quartet(self.network_parameters)
+
+            # Accumulate R_Q_mat @ E_Q_mat of each quartet Q to sum_RE, and accumulate H_Q_mat to H_mat
+            sum_RE += R_Q_mat @ q_data.E_mat
+            H_mat += H_Q_mat
+
+        return sum_RE, H_mat
+
+    def get_variability_matrix(self):
+        """Get the variability matrix (J_mat) and the sensitivity matrix (H_mat) of the network composite likelihood."""
+        J_mat = self.sum_RE @ self.empir_var @ self.sum_RE.T
+        return J_mat
+
+    def get_score_function(self):
+        """Get the composite score function (U_c) of the network composite likelihood."""
+        U_c = (self.sum_RE @ self.n_D).T
+        return U_c
+
+    def get_curvAdjust_matrix(self):
+        """Use J_mat derived from get_variability_matrix() and H_mat derived from _precompute_sum_RE_sens_mat()
+        to get curvature adjustment matrix C."""
+        J_mat = self.get_variability_matrix()
+        H_mat = self.H_mat
+
+        def compute_M_inv(H_mat):
+            U, D, _ = np.linalg.svd(H_mat)
+            return U @ np.diag(D ** (-1/2)) @ U.T
+
+        def compute_M_A(H_mat, J_mat):
+            Godambe_mat = H_mat @ np.linalg.inv(J_mat) @ H_mat
+            U, D, _ = np.linalg.svd(Godambe_mat)
+            return U @ np.diag(np.sqrt(D)) @ U.T
+
+        M_inv = compute_M_inv(H_mat)
+        M_A = compute_M_A(H_mat, J_mat)
+        curv_adj_mat = M_inv @ M_A
+
+        return curv_adj_mat
 
 
 #####################################################
 ## Code Metropolis-within-Gibbs sampling algorithm ##
 #####################################################
-
-def log_invgamma(x, alpha, beta):
-    return -(alpha + 1) * np.log(x) - beta / x
-
-def log_beta(x, alpha, beta):
-    return np.sum((alpha - 1) * np.log(x) * (beta - 1) * np.log(1 - x))
-
-def get_tau_prior_and_constraint(phylox_network):
-    """Given a self topology, automatically generate a joint prior function for tau: "log_prior_tau",
-    boundaries of tau for proposal kernal: "get_tau_boundaries", and a boolean function of whether tau is in
-    its constraint so that we reject bad tau's after curvature adjustment: "tau_in_constraints". """
-
-    # Label the speciation times in pre-order traversal
-    clone_network = phylox_network.copy() # Copy the self to avoid modifying the original
-    label_speciation_time_idx(clone_network)
-
-    # Sorts child nodes in descending order in terms of the number of children each child node has.
-    # This is for the convenience of counting the number of continuous nodes in an asymmetric pattern
-    clone_network = ladderize(clone_network, ascending=False)
-
-    # Preparation to set up the tau prior
-    h = len(phylox_network.reticulations)   # number of hybrids
-    J = len(phylox_network.leaves) + h - 1  # total number of tau parameters
-    tauPrior_idx = []
-    tauPrior_pwr = []
-    asymm_pattern_count = 0
-    leaves = clone_network.leaves   # Cache the leaves
-    preorder_internal_node = [n for n in clone_network.nodes() if n not in clone_network.leaves] # Cache the internal nodes
-
-    # Preorder traversing the internal nodes of a sorted clone_network
-    for node in preorder_internal_node:
-        # If an internal node has both child nodes being leaves, then we skip it.
-        if sum(child in leaves for child in clone_network.successors(node)) == 2:
-            if asymm_pattern_count > 0:  # store the asymm_pattern_count in tauPrior_pwr and reset asymm_pattern_count
-                tauPrior_pwr.append(-asymm_pattern_count)
-                asymm_pattern_count = 0
-            continue
-
-        # True/False: one of the two child nodes is leaf_node.
-        any_leaf_node = any(child in leaves for child in clone_network.successors(node))
-
-        # If this node has at least one child as leaf_node, then it is a start of asymmetric pattern.
-        if any_leaf_node:
-            if asymm_pattern_count == 0:  # Only save the most ancestral node_idx of an asymmetric pattern
-                tauPrior_idx.append(get_label_from_node(clone_network, node))
-            asymm_pattern_count += 1
-
-        # If this node has no child as leaf_node, then this node together with its two child nodes are symmetric pattern.
-        else:
-            if asymm_pattern_count > 0:  # store the asymm_pattern_count in tauPrior_pwr and reset asymm_pattern_count
-                tauPrior_pwr.append(-asymm_pattern_count)
-                asymm_pattern_count = 0
-            # Save the most ancestral node_idx of a symmetric pattern and its power is -2
-            tauPrior_idx.append(get_label_from_node(clone_network, node))
-            tauPrior_pwr.append(-2)
-
-    # Store the asymm_pattern_count in tauPrior_pwr if it ends the internal nodes iterator
-    if asymm_pattern_count > 0:
-        tauPrior_pwr.append(-asymm_pattern_count)
-
-    # Get the constraints of tau as a list of pairs
-    constraint = [[get_label_from_node(clone_network, list(clone_network.predecessors(node))[0]), # parent node
-                   get_label_from_node(clone_network, node)]                                      # child node
-                  for node in [n for n in clone_network.nodes() if n not in clone_network.leaves]
-                  if next(clone_network.predecessors(node), None) is not None]
-
-    # Adjust for the indexing of tau = [tau_J,...,tau_1]
-    tauPrior_idx_adj = J - np.array(tauPrior_idx)
-    constraint_adj = J - np.array(constraint)
-    # Extract the 'i' and 'j' columns as separate 1D arrays
-    i_idx = constraint_adj[:, 0]
-    j_idx = constraint_adj[:, 1]
-
-    # Get boolean function of whether tau is in constraint
-    def tau_in_constraints(tau):
-        # return all([tau[i] > tau[j] for i, j in constraint_adj])
-        return np.all(tau[i_idx] > tau[j_idx])
-
-    # Get joint prior for tau
-    def log_prior_tau(tau, invgamma_alpha=None, invgamma_beta=None):
-        # If user do not specify alpha, the prior is flat by default.
-        if invgamma_alpha == None:
-            invgamma_alpha = 3
-
-        # If user do not specify beta, the prior for root age is conservative by default.
-        if invgamma_beta == None:
-            invgamma_beta = 0.002
-
-        # Check if all tau's satisfy the constraint
-        if not tau_in_constraints(tau):
-            return -np.inf
-
-        # The prior of root age follows inverse gamma. The prior of other speciation times follow kernel of uniform
-        log_prior = log_invgamma(tau[0], invgamma_alpha, invgamma_beta) + \
-                    np.sum(tauPrior_pwr * np.log(tau[tauPrior_idx_adj]))
-
-        return log_prior
-
-    # Get boundaries of each tau
-    def get_tau_boundaries(current_tau):
-        lwr_b = np.zeros(J)          # Default lower bound is 0
-        upr_b = np.full(J, np.inf)   # Default upper bound is inf
-
-        # Vectorized in-place updates.
-        np.maximum.at(lwr_b, i_idx, current_tau[j_idx])
-        np.minimum.at(upr_b, j_idx, current_tau[i_idx])
-
-        return np.column_stack((lwr_b, upr_b))
-
-    return log_prior_tau, get_tau_boundaries, tau_in_constraints
 
 def proposal_kernel(current_values, step_width, boundaries, type=None):
     """Reference (Yang 2014, page 222~225)"""
@@ -3802,156 +3706,6 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
     print(f"adjCL, P_jump of tau: {accept_ratio_tau:.3f}, P_jump of theta: {accept_ratio_theta:.3f}, P_jump of gamma: {accept_ratio_gamma:.3f}")
 
     return np.array(MCMC_samples)
-
-
-# def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, self,  # species network info
-#                         nsample, thin, step_width, curvAdjust_matrix, prop_kern=None,  # MCMC settings
-#                         thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,  # User costomized prior and MCLE
-#                         prog_bar=None):  # show progress bar: yes/no
-#     """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
-#     get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
-#     from tqdm import trange  # Included to show progress bar
-#     import numpy as np
-#
-#     h = len(self.reticulations)  # number of hybrids
-#     J = len(self.leaves) + h - 1  # total number of tau parameters
-#
-#     if MCLE is None:
-#         MCLE, _ = get_MCLE_parameters(zipped_data_net, self)
-#
-#     log_prior_tau, get_tau_boundaries, tau_in_constraints = get_tau_prior_and_constraint(self)
-#
-#     if thetaPr is None:
-#         a_theta = 3
-#         b_theta = MCLE[J] * (a_theta - 1)
-#     else:
-#         a_theta = thetaPr[0]
-#         b_theta = thetaPr[1]
-#
-#     if tauPr is None:
-#         a_tau = 3
-#         b_tau = MCLE[0] * (a_tau - 1)
-#     else:
-#         a_tau = tauPr[0]
-#         b_tau = tauPr[1]
-#
-#     gamma_bound = [[0, 1]] * h
-#     if gammaPr is None:
-#         a_gamma = 1
-#         b_gamma = 1
-#     else:
-#         a_gamma = gammaPr[0]
-#         b_gamma = gammaPr[1]
-#
-#     # 1. CHANGE: Initialize tau acceptance count as an array of size J
-#     accept_count_tau = np.zeros(J)
-#     accept_count_theta = 0
-#     accept_count_gamma = 0
-#
-#     MCMC_samples = []
-#     curr_param = MCLE.copy()
-#     C = np.asarray(curvAdjust_matrix)
-#
-#     curr_star = MCLE + C @ (curr_param - MCLE)
-#     curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_star)
-#
-#     total_iter = int(nsample * thin)
-#     if prog_bar is None or prog_bar:
-#         iter_range = trange(total_iter, desc="MCMC curvAdjust_matrix CL")
-#     else:
-#         iter_range = range(total_iter)
-#
-#     for iteration in iter_range:
-#         # ---------------------------------------------------------
-#         # Step 1: Sampling theta
-#         # ---------------------------------------------------------
-#         new_param = curr_param.copy()
-#         curr_logprior = log_invgamma(curr_param[J], a_theta, b_theta)
-#         while True:
-#             new_param[J] = proposal_kernel(curr_param[J], step_width[1], (5e-5, 0.2), prop_kern)
-#             new_star = MCLE + C @ (new_param - MCLE)
-#             if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
-#                 break
-#         new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-#         new_logprior = log_invgamma(new_param[J], a_theta, b_theta)
-#
-#         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-#             curr_param[J] = new_param[J]
-#             curr_loglik = new_loglik
-#             accept_count_theta += 1
-#
-#         # ---------------------------------------------------------
-#         # Step 2: Sampling tau (ELEMENT-WISE)
-#         # ---------------------------------------------------------
-#         for i in range(J):
-#             new_param = curr_param.copy()
-#             curr_logprior = log_prior_tau(curr_param[:J], a_tau, b_tau)
-#
-#             while True:
-#                 boundaries = get_tau_boundaries(curr_param[:J])
-#                 step_i = step_width[0][i] if isinstance(step_width[0], (list, np.ndarray)) else step_width[0]
-#
-#                 new_param[i] = proposal_kernel(curr_param[i], step_i, boundaries[i], prop_kern)
-#
-#                 new_star = MCLE + C @ (new_param - MCLE)
-#                 if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
-#                     break
-#
-#             new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-#             new_logprior = log_prior_tau(new_param[:J], a_tau, b_tau)
-#
-#             if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-#                 curr_param[i] = new_param[i]
-#                 curr_loglik = new_loglik
-#                 # 2. CHANGE: Increment only the specific i-th counter
-#                 accept_count_tau[i] += 1
-#
-#         # ---------------------------------------------------------
-#         # Step 3: Sampling gamma
-#         # ---------------------------------------------------------
-#         new_param = curr_param.copy()
-#         curr_logprior = log_beta(curr_param[-h:], a_gamma, b_gamma)
-#         while True:
-#             new_param[-h:] = proposal_kernel(curr_param[-h:], step_width[2], gamma_bound, prop_kern)
-#             new_star = MCLE + C @ (new_param - MCLE)
-#             if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
-#                 break
-#         new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-#         new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
-#
-#         if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-#             curr_param[-h:] = new_param[-h:]
-#             curr_loglik = new_loglik
-#             accept_count_gamma += 1
-#
-#         # ---------------------------------------------------------
-#         # Step 4: store samples and update progress
-#         # ---------------------------------------------------------
-#         if iteration % thin == 0:
-#             MCMC_samples.append(curr_param.copy())
-#             if prog_bar is None or prog_bar:
-#                 # 3. CHANGE: Denominator is back to (iteration + 1). Format array as string.
-#                 accept_ratio_tau = accept_count_tau / (iteration + 1)
-#                 tau_str = np.array2string(accept_ratio_tau, precision=2, separator=',', floatmode='fixed')
-#
-#                 accept_ratio_theta = accept_count_theta / (iteration + 1)
-#                 accept_ratio_gamma = accept_count_gamma / (iteration + 1)
-#
-#                 # tau_str will output an array like: [0.34,0.45,0.20,0.50]
-#                 iter_range.set_postfix(tau_Pjump=tau_str,
-#                                        theta_Pjump=f"{accept_ratio_theta:.2f}",
-#                                        gamma_Pjump=f"{accept_ratio_gamma:.2f}")
-#
-#     # 4. CHANGE: Final ratio calculations
-#     accept_ratio_tau = accept_count_tau / total_iter
-#     accept_ratio_theta = accept_count_theta / total_iter
-#     accept_ratio_gamma = accept_count_gamma / total_iter
-#
-#     tau_str_final = np.array2string(accept_ratio_tau, precision=3, separator=',', floatmode='fixed')
-#     print(
-#         f"adjCL, P_jump of taus: {tau_str_final}, P_jump of theta: {accept_ratio_theta:.3f}, P_jump of gamma: {accept_ratio_gamma:.3f}")
-#
-#     return np.array(MCMC_samples)
 
 
 ####################################################################

@@ -54,7 +54,7 @@ def get_taxa_label(phylox_network):
             seen.add(t)
             ordered_unique.append(t)
 
-    # Remove elements that are not in phylox_network.labels
+    # Remove elements that are not in self.labels
     taxa_labels = list(phylox_network.labels)
     ordered_labels = [l for l in ordered_unique if l in taxa_labels]
 
@@ -158,7 +158,7 @@ def ladderize_network(phylox_network, ascending=False):
         raise ValueError("The network must be a directed acyclic graph (DAG).")
 
     # 1. Identify all leaf_node nodes (nodes with an out-degree of 0)
-    leaves = phylox_network.leaves  # {n for n, d in phylox_network.out_degree() if d == 0}
+    leaves = phylox_network.leaves  # {n for n, d in self.out_degree() if d == 0}
 
     # 2. Compute the set of descendant leaves for every node
     # A reverse topological sort ensures we process children before their parents
@@ -176,7 +176,7 @@ def ladderize_network(phylox_network, ascending=False):
     # 3. Create a new PhyloX network to hold the sorted structure
     ladderized_net = phylox_network.__class__()
 
-    # Copy all nodes of phylox_network and their index labels to ladderized_net
+    # Copy all nodes of self and their index labels to ladderized_net
     ladderized_net.add_nodes_from(phylox_network.nodes(data=True))
 
     # 4. Add edges back in sorted order
@@ -391,7 +391,7 @@ def get_displayedTreeNewick_gammaID(phylox_network, major_tree):
 
 def get_weighted_displayed_tree(phylox_network, major_tree):
     """
-    Given a phylogenetic network from PhyloX: phylox_network, returns a list of displayed_tree, where displayed_tree
+    Given a phylogenetic network from PhyloX: self, returns a list of displayed_tree, where displayed_tree
     is a DiNetwork with one parental choice at each hybrid, and returns a list of gamma_id that directs computation
     of weight of a displayed tree from gamma parameters.
 
@@ -412,7 +412,7 @@ def get_weighted_displayed_tree(phylox_network, major_tree):
         # Remove one in-edge
         phylox_network.remove_edge(parent, child)
         # Suppress the degree 2 node
-        # suppress_node(phylox_network, parent)
+        # suppress_node(self, parent)
 
     def get_leaf_labels_below_node(phylox_network, node):
         """
@@ -505,7 +505,7 @@ def label_speciation_time_idx(phylox_network):
 def get_newick_format(labeled_network):
     """
     Get a simple Newick string from a labeled network, ignoring all internal node labels.
-    Usually, we can use command phylox_network.newick() to print Newick format. This function exists because
+    Usually, we can use command self.newick() to print Newick format. This function exists because
     labeled_network.newick() will report error.
     """
 
@@ -568,7 +568,7 @@ def get_quartet_parameter_idx(labeled_quartet):
 
 def print_tree(phylox_tree):
     """
-    Using DendroPy graphing tool, print a PhyloX phylox_network in ASCII format and Newick format.
+    Using DendroPy graphing tool, print a PhyloX self in ASCII format and Newick format.
     """
     import dendropy
     clone_tree = phylox_tree.copy()
@@ -1321,7 +1321,7 @@ def get_n_D_hasAmbiguityCode(CIS_data, ACGT_weight=None, skip_gap=False, skip_mi
     if ACGT_weight is None:
         ACGT_weight = [1, 1, 1, 1]
 
-    # Extract sequence of each taxa by phylox_network tip order into a list, and reformat the elements (nucleotides) into string format
+    # Extract sequence of each taxa by self tip order into a list, and reformat the elements (nucleotides) into string format
     sequence_matrix = [[str(element) for element in CIS_data[taxon.label]] for taxon in CIS_data.taxon_namespace]
 
     # Use numpy to transpose the sequence matrix so that the rows are site patterns
@@ -1594,7 +1594,7 @@ def get_taxa_partition(CIS_data, phylox_network, Imap_file_path):
         return False
 
     taxa_partition = [
-        # CIS_data row indices of the taxa that contains the species name in the phylox_network
+        # CIS_data row indices of the taxa that contains the species name in the self
         [idx for idx, CIS_taxon in enumerate(CIS_data.taxon_namespace) if matches(CIS_taxon.label, imap_dict[label])]
         for label in get_taxa_label(phylox_network)
     ]
@@ -1626,7 +1626,7 @@ def pair_quartetRows_quartetFeatures(CIS_data, phylox_network, major_tree, taxa_
     # Step 2: Get all one-individual-per-species mappings (row indices of CIS_data) according to taxa_partition.
     all_1indivPerSpecies_maps = product(*taxa_partition)
 
-    # Step 3: Get all possible quartet features from phylox_network
+    # Step 3: Get all possible quartet features from self
     all_param_idx, all_isAsymm, all_taxaPerm, all_gamma_id = get_all_quartet_features(phylox_network, major_tree)
 
     # Step 4: Pair up quartet features (param_idx, isAsymm, taxaPerm, gamma_id) with the corresponding quartet_rows
@@ -1897,7 +1897,7 @@ def parameter_backtransform(trans_param, labeled_network):
 
 def get_MCLE_parameters(zipped_data_net, phylox_network, gamma_parameters=None, is_fixed_param=None,
                         MultiStart=None, Warning=False):
-    """Get MCLE for phylox_network parameters = [tau_1,...,tau_J, theta, gamma_1,...,gamma_h].
+    """Get MCLE for self parameters = [tau_1,...,tau_J, theta, gamma_1,...,gamma_h].
     is_fixed_param decides which parameters are fixed for constrained optimization."""
     # ---------------------------------------
     # Imports packages and network informations
@@ -3118,12 +3118,12 @@ def log_beta(x, alpha, beta):
     return np.sum((alpha - 1) * np.log(x) * (beta - 1) * np.log(1 - x))
 
 def get_tau_prior_and_constraint(phylox_network):
-    """Given a phylox_network topology, automatically generate a joint prior function for tau: "log_prior_tau",
+    """Given a self topology, automatically generate a joint prior function for tau: "log_prior_tau",
     boundaries of tau for proposal kernal: "get_tau_boundaries", and a boolean function of whether tau is in
     its constraint so that we reject bad tau's after curvature adjustment: "tau_in_constraints". """
 
     # Label the speciation times in pre-order traversal
-    clone_network = phylox_network.copy() # Copy the phylox_network to avoid modifying the original
+    clone_network = phylox_network.copy() # Copy the self to avoid modifying the original
     label_speciation_time_idx(clone_network)
 
     # Sorts child nodes in descending order in terms of the number of children each child node has.
@@ -3528,7 +3528,7 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
     return np.array(MCMC_samples)
 
 
-# def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,  # species network info
+# def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, self,  # species network info
 #                         nsample, thin, step_width, curvAdjust_matrix, prop_kern=None,  # MCMC settings
 #                         thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,  # User costomized prior and MCLE
 #                         prog_bar=None):  # show progress bar: yes/no
@@ -3537,13 +3537,13 @@ def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,
 #     from tqdm import trange  # Included to show progress bar
 #     import numpy as np
 #
-#     h = len(phylox_network.reticulations)  # number of hybrids
-#     J = len(phylox_network.leaves) + h - 1  # total number of tau parameters
+#     h = len(self.reticulations)  # number of hybrids
+#     J = len(self.leaves) + h - 1  # total number of tau parameters
 #
 #     if MCLE is None:
-#         MCLE, _ = get_MCLE_parameters(zipped_data_net, phylox_network)
+#         MCLE, _ = get_MCLE_parameters(zipped_data_net, self)
 #
-#     log_prior_tau, get_tau_boundaries, tau_in_constraints = get_tau_prior_and_constraint(phylox_network)
+#     log_prior_tau, get_tau_boundaries, tau_in_constraints = get_tau_prior_and_constraint(self)
 #
 #     if thetaPr is None:
 #         a_theta = 3
