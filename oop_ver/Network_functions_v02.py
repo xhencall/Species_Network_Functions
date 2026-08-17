@@ -3,22 +3,6 @@
 
 # To fully display matrix, use this code below
 # noinspection PyTypeChecker
-import numpy as np
-# np.set_printoptions(suppress=True, linewidth=np.nan)
-
-###############################
-## Import required packages  ##
-###############################
-import copy, re, phylox, dendropy, itertools, warnings
-import networkx as nx
-from abc import ABC, abstractmethod
-from phylox.constants import LABEL_ATTR
-from phylox import suppress_node
-from dataclasses import dataclass
-from itertools import combinations, product
-from collections import Counter, defaultdict
-from scipy.optimize import minimize
-
 
 ##############################################################
 ## Graphical illustration of relationships between classes  ##
@@ -103,6 +87,22 @@ from scipy.optimize import minimize
 #                   ┌───────────────────────────┐                  ┌────────────────────┐
 #                   │Curvature Adjustment Matrix│                  │Composite Likelihood│
 #                   └───────────────────────────┘                  └────────────────────┘
+
+import numpy as np
+# np.set_printoptions(suppress=True, linewidth=np.nan)
+
+###############################
+## Import required packages  ##
+###############################
+import copy, re, phylox, dendropy, itertools, warnings
+import networkx as nx
+from abc import ABC, abstractmethod
+from phylox.constants import LABEL_ATTR
+from phylox import suppress_node
+from dataclasses import dataclass
+from itertools import combinations, product
+from collections import Counter, defaultdict
+from scipy.optimize import minimize
 
 ############################################
 ## Class for phylox network manipulation  ##
@@ -842,7 +842,7 @@ class TreeParameters:
         """
         param_idx_0base = self.num_tau - np.array(param_idx)  # adjust for 0-based indexing of tau
 
-        # Output in tau1, tau2, tau3 for convenience to input in getTrueProbs functions.
+        # Output in tau1, tau2, tau3 for convenience to input in get_true_probs functions.
         return [self.tau[i] for i in param_idx_0base[::-1]] + [self.theta]
 
 @dataclass
@@ -988,7 +988,7 @@ class NetworkParameters:
 
 
 #################################################################################################
-## Use polymorphism of OOP to bypass "if is_asymm:" for getTrueProbs of symm and asymm quartet ##
+## Use polymorphism of OOP to bypass "if is_asymm:" for get_true_probs of symm and asymm quartet ##
 #################################################################################################
 
 class QuartetTreeTopology(ABC):
@@ -1279,7 +1279,7 @@ class AsymmQuartet(QuartetTreeTopology):
         t = 2 * theta_tilde  # 2*theta.tilde
         m = 4 / 3  # mu for JC69
 
-        # 15-categ TrueProbs of quartet Q_t pulled from D_t
+        # 15-categ true probs of quartet Q_t pulled from D_t
         p_Qt = np.matrix(quartet_tree_feature.topology.get_true_probs(t1, t2, t3, theta_tilde, m)).T
         # get gamma weight for Q_t (Gamma_t)
         Gamma_t = network_parameters.gamma.get_gamma_weight(quartet_tree_feature.gamma_id)
@@ -1801,7 +1801,7 @@ class SymmQuartet(QuartetTreeTopology):
         t = 2 * theta_tilde  # 2*theta.tilde
         m = 4 / 3  # mu for JC69
 
-        # 15-categ TrueProbs of quartet Q_t pulled from D_t
+        # 15-categ true probs of quartet Q_t pulled from D_t
         p_Qt = np.matrix(quartet_tree_feature.topology.get_true_probs(t1, t2, t3, theta_tilde, m)).T
         # get gamma weight for Q_t (Gamma_t)
         Gamma_t = network_parameters.gamma.get_gamma_weight(quartet_tree_feature.gamma_id)
@@ -2316,6 +2316,11 @@ class QuartetFeature:
         """Delegates gamma_id directly to the underlying QuartetTreeFeature."""
         return np.array([tf.gamma_id for tf in self.tree_features])
 
+    def set_gamma_id(self, gamma_id) -> None:
+        """Overwrite cleaned gamma_id to the underlying QuartetTreeFeature."""
+        for tf, gi in zip(self.tree_features, gamma_id):
+            tf.gamma_id = gi
+
     def to_dict(self):
         """Helper to convert to a dictionary if matrix format is needed for downstream models."""
         return {
@@ -2359,18 +2364,18 @@ class QuartetFeature:
             p_Qt = qt_feat.topology.get_true_probs(tau1, tau2, tau3, theta, alpha)
             all_p_Qt.append(p_Qt[sp_relation])  # Append site pattern probabilities with site pattern mapping applied
 
-        # 4. Normalize gamma weights & compute TrueProbs
+        # 4. Normalize gamma weights & compute true probs
         all_p_Qt = np.array(all_p_Qt)
         all_Gamma_t = np.array(all_Gamma_t)
         if self.num_retic > 1:  # quartet is a network
             if np.isclose(all_Gamma_t.sum(), 0.0):
                 raise ValueError("The denominator all_Gamma_t.sum() is zero when normalizing gamma weights.")
             all_Gamma_t = all_Gamma_t / all_Gamma_t.sum()
-            TrueProbs = all_p_Qt.T @ all_Gamma_t
+            true_probs = all_p_Qt.T @ all_Gamma_t
         else:  # quartet is a tree
-            TrueProbs = all_p_Qt[0]
+            true_probs = all_p_Qt[0]
 
-        return TrueProbs
+        return true_probs
 
 @dataclass
 class PairedQuartetFeature:
@@ -2439,29 +2444,31 @@ class QuartetData:
         # Get parameters, gamma_weights and true site pattern probs
         num_tau = network_parameters.num_tau    # number of tau's
         num_param = network_parameters.total_params
-        Q_param_idx = set()
 
         # Create zero matrices for summation.
         first_der_p_Q = np.zeros((15, num_param))
         second_der_p_Q = np.zeros((num_param, num_param, 15))
 
-        # Remove common gamma indices in gamma_id for the ease of taking derivative of Gamma_t
-        gamma_id_clean = network_parameters.gamma.remove_common_elements(self.gamma_id)
 
-        for qt_feat, gamma_id in zip(self.tree_features, gamma_id_clean):
+        q_feature_clean = self.quartet_feature.copy()
+        if self.gamma_id.shape[0] != 2 ** self.gamma_id.shape[1]:
+            # Remove common gamma indices in gamma_id for the ease of taking derivative of Gamma_t
+            gamma_id_clean = network_parameters.gamma.remove_common_elements(self.gamma_id)
+            q_feature_clean.set_gamma_id(gamma_id_clean)
+
+        for qt_feat in q_feature_clean.tree_features:
             # ---- Step 1: Get the first and second derivatives of [Γ_t * Ω_t @ p_{D^Q_t}] ----
             first_der_qt, second_der_qt = qt_feat.topology.Qt_1st_2nd_deriv(network_parameters, qt_feat)
 
             # Get all indices of the tau's, theta, gamma's of this D^Q_t quartet
             # param_idx reversed because tau_id in Qt_1st_2nd_deriv() is [t1,t2,t3] but param_idx is [t3,t2,t1]
-            tau_idx = num_tau - qt_feat.param_idx[::-1]      # Convert to 0-based indices for tau.
+            tau_idx = num_tau - np.asarray(qt_feat.param_idx[::-1], dtype = int)     # Convert to 0-based indices for tau.
             theta_idx = [num_tau]             # Convert to 0-based indices for theta
-            if gamma_id.size > 0:
-                gamma_idx = num_tau + np.abs(gamma_id)     # Convert to 0-based indices for gamma
+            if len(qt_feat.gamma_id) > 0:
+                gamma_idx = num_tau + np.abs(qt_feat.gamma_id)     # Convert to 0-based indices for gamma
                 Qt_param_idx = np.concatenate((tau_idx, theta_idx, gamma_idx))
             else:
                 Qt_param_idx = np.concatenate((tau_idx, theta_idx))
-            Q_param_idx.update(Qt_param_idx)
 
             # ---- Step 2: Accumulate these derivatives to get the first and second derivatives of p_Q ----
             # Accumulate to first_der_p_Q by Qt_param_idx
@@ -2472,7 +2479,7 @@ class QuartetData:
             second_der_p_Q[row_idx, col_idx, :] += second_der_qt
 
         # ---- Step 3: get the gradient and Hessian of this quartet subnetwork ----
-        p_Q = self.getTrueProbsQuartet(network_parameters)
+        p_Q = self.get_true_probs(network_parameters)
         # R_Q matrix = gradient vector of log(p_Q)
         R_Q_mat = first_der_p_Q.T / p_Q
 
@@ -3323,9 +3330,9 @@ class Optimizer:
         return mcle_net_params, max_comp_log_lik
 
 
-###########################################################################################
+###########################################
 ## Compute curvature adjustment matrix C ##
-###########################################################################################
+###########################################
 
 class CurvatureAdjustmentCalculator:
     """Finds curvature adjustment matrix C for network composite likelihood"""
@@ -3825,123 +3832,3 @@ def modified_CompLik_ratio_stat(zipped_data_net, all_E_mat, n_D, phylox_network,
     # return the modified profile composite likelihood ratio statistics and the degree of freedom
     return mpCLRT, V
 
-
-#######################################################
-## Code automated network data simulation using PAUP ##
-#######################################################
-
-def read_chopped_data(list_file_path, schema):
-    import dendropy
-
-    # Shared taxon namespace ensures taxa match across loci
-    taxa = dendropy.TaxonNamespace()
-
-    # Use the generic CharacterMatrix so DendroPy respects the file's internal datatype
-    all_data_matrix = [
-        dendropy.NucleotideCharacterMatrix.get(
-            path=fp,
-            schema=schema,
-            taxon_namespace=taxa
-        )
-        for fp in list_file_path
-    ]
-
-    # Efficient concatenation using that specific class's method
-    merged_data = dendropy.NucleotideCharacterMatrix.concatenate(all_data_matrix)
-
-    return merged_data
-
-
-def merge_data(list_file_path, outfile_path, schema):
-
-    merged_data = read_chopped_data(list_file_path, schema)
-
-    # Write output
-    merged_data.write(
-        path=outfile_path,
-        schema=schema
-    )
-
-    print(f"Concatenated DNA alignment matrix are written to: {outfile_path}")
-
-
-def simdata_nex_file(taxa_labels, trees, theta, total_loci, gamma_weights, indPerSpecies, outfile):
-    """
-    Generate a PAUP* NEXUS script to simulate multilocus DNA data under a network model using two trees.
-    """
-    # Fixed constants
-    Ne = 100000
-    mu = theta / (2 * Ne)
-
-    ntax = len(taxa_labels)
-    taxa_str = " ".join(taxa_labels)
-
-    with open(outfile, "w") as f:
-        f.write("#NEXUS\n\n")
-
-        # Taxa block
-        f.write("begin taxa;\n"
-                f"\tdimensions ntax={ntax};\n"
-                f"\ttaxlabels {taxa_str};\n"
-                "end;\n\n")
-
-        # Evaluate this once outside the loop for speed
-        is_single_tree = len(gamma_weights) == 1
-        allocated_loci = 0
-
-        for i, gamma in enumerate(gamma_weights):
-            tree_idx = i + 1
-
-            # Safely calculate loci to prevent losing loci to float truncation
-            if tree_idx == len(gamma_weights):
-                loci = total_loci - allocated_loci  # Last tree gets whatever is left
-            else:
-                loci = int(total_loci * gamma)
-                allocated_loci += loci
-
-            # Set outfile name
-            outfile = "network_data.nex" if is_single_tree else f"tree_data{tree_idx}.nex"
-
-            # Write the block
-            f.write(
-                f"[ Simulate {gamma:.0%} of data for species tree {tree_idx} ]\n"
-                "begin trees;\n"
-                f"\ttree 1 = [&R] {trees[i]};\n"
-                "end;\n\n"
-                "begin dnasim;\n"
-                f"\tsimdata multilocus=y nloci={loci} nsitesperlocus=1 indPerSpecies={indPerSpecies};\n"
-                "\ttruetree source=memory treenum=1 units=2Ngen\n"
-                "\t         scalebrlen=1\n"
-                f"\t         mscoal=y Ne={Ne} mu={mu:.4e} seed=0\n"
-                "\t         showtruetree=brlens showgenetrees=n storetruetrees=n;\n"
-                "\tlset nst=1 basefreq=(0.25 0.25 0.25 0.25);\n"
-                "\tbeginsim nreps=1 seed=0;\n"
-                f"\t\texport file={outfile} format=nexus charsperline=all;\n"
-                "\tendsim;\n"
-                "end;\n\n"
-            )
-
-
-def parse_config_file(config_path):
-    import re
-    config = {}
-    with open(config_path, 'r') as file:
-        for line in file:
-            line = line.strip()
-            # Skip blank lines and lines that START with a comment
-            if line and not line.startswith("#"):
-                # Only split if '#' is preceded by whitespace (\s+). This protects hybrid tags like '#H1' from being deleted
-                line = re.split(r'\s+#', line, maxsplit=1)[0].strip()
-                if "=" in line:
-                    key, value = [part.strip() for part in line.split("=", 1)]
-                    config[key] = value
-
-    # Convert values to appropriate types
-    config['seed'] = int(config['seed'])
-    config['nsample'] = int(config['nsample'])
-    config['thin'] = int(config['thin'])
-    config['step_width'] = [float(config['step_width_tau']), float(config['step_width_theta']), float(config['step_width_gamma'])]
-    config['tauprior'] = [float(config['tau_prior_alpha']), float(config['tau_prior_beta'])]
-    config['thetaprior'] = [float(config['theta_prior_alpha']), float(config['theta_prior_beta'])]
-
-    return config
