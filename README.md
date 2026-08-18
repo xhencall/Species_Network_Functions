@@ -59,7 +59,7 @@ Below is a conceptual workflow illustrating how to estimate network parameters a
 ```python
 import phylox
 import dendropy
-from phylox_network_tools import (
+from Network_functions_v01 import (
     get_zippedData_net,
     get_zippedData_net_reduced,
     get_MCLE_parameters,
@@ -106,6 +106,7 @@ mcmc_samples = MCMC_curvAdjCompLik(
 This toolkit builds upon theoretical foundations and software frameworks from:
 
 * **PhyloX:** Framework for phylogenetic network topology manipulation in Python.
-* **Chifman & Kubatko (2015):** Analytic site pattern probabilities under the Multispecies Network Coalescent (MSNC) model.
+* **Ribatet et al. (2012):**Curvature adjustments for using composite likelihood in MCMC.
+* **Chifman & Kubatko (2015):** Analytic site pattern probabilities under the Multispecies Coalescent (MSC) model.
 * **Chen et al. (2018):** Composite likelihood ratio testing and profile composite likelihood inference on phylogenetic networks.
-* **Kong et al. (2025):** Parameter transformations, Godambe curvature adjustments, and composite likelihood Bayesian inference under MSNC models.
+* **Kong et al. (2025):** Parameter transformations, and species network composite likelihood under Multispecies Network Coalescent (MSNC) models.
