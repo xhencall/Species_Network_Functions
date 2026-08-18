@@ -8,7 +8,7 @@
 ## Graphical illustration of relationships between classes  ##
 ##############################################################
 
-# =================== Regular Processing classes relationship diagram ===============
+# =================== Data Preprocessing classes relationship diagram ===============
 #   ┌────────────────┐(passed to) ┌────────────────────────┐
 #   │ SpeciesNetwork │───────────►│ DisplayedTreeExtractor │
 #   └───────┬────────┘            └──────────┬─────────────┘
@@ -73,20 +73,161 @@
 #                         ▼                      ▼
 #           ┌─────────────────────┐    ┌──────────────────┐      ┌────────────────┐  ┌────────────────┐
 #           │  FullSitePatterns   │    │   QuartetData    │      │ TreeParameters │  │ GammaParameters│
-#           └─────────────────────┘    └────┬─────────┬───┘      └───────┬────────┘  └───────┬────────┘
-#                         │                 │         │                  │  (subclasses of)  │
-#                         │                 │         │                  └──────────┬────────┘
-#                         │                 │         │                             │
-#                         │                 │         │                             ▼
-#                         │                 │         │                  ┌────────────────────┐
-#                         │                 │         │                  │ NetworkParameters  │
-#                         │                 │         │                  └────────┬───────────┘
-#                         │                 │         └─────────────────┐         │
-#                         │                 │                           │         │
-#                         ▼                 ▼                           ▼         ▼
-#                   ┌───────────────────────────┐                  ┌────────────────────┐
-#                   │Curvature Adjustment Matrix│                  │Composite Likelihood│
-#                   └───────────────────────────┘                  └────────────────────┘
+#           └─────────────┬───────┘    └──┬───┬───────┬───┘      └───────┬────────┘  └───────┬────────┘
+#                         │               │   │       │                  │  (subclasses of)  │
+#                         │               │   │       │                  └──────────┬────────┘
+#                         │               │   │       │                             │
+#                         │               │   │       │                             ▼
+#                         │               │   │       │                  ┌────────────────────┐
+#                         │ ┌─────────────┘   │       │                  │ NetworkParameters  │
+#                         │ │                 │       │                  └──────────────┬─────┘
+#                         │ │ ┌───────────────┘       └───────────────────────┐         │
+#                         │ │ │                                               │         │
+# ======================= │ │ │ ==== Utility classes relationship diagram === │ ======= │ ==========================
+#                         │ │ │                                               │         │
+#                         │ │ │  ┌──────────────────────┐                     ▼         ▼
+#                         │ │ │  │ ParameterTransformer │────┐          ┌────────────────────────┐
+#                         │ │ │  └──────────────────────┘    │ ┌────────│get_network_comp_log_lik│
+#                         │ │ │  ┌───────────────────────┐   │ │        └──────────┬─────────────┘
+#                         │ │ │  │ TauPriorTauConstraint │─┐ │ │                   │
+#                         │ │ │  └───────────────────────┘ │ │ │                   │
+#                         │ │ │  ┌──────────────┐          │ │ │                   │
+#                         │ │ │  │ MOMEstimator │────────┐ │ │ │                   │
+#                         │ │ │  └──────────────┘        │ │ │ │                   │
+#                         │ │ │                          ▼ ▼ ▼ ▼                   │
+#                         │ │ │   ┌───────────────────────────────┐                │
+#                         │ │ └──►│           Optimizer           │                │
+#                         │ │     └─────────────┬─────────────────┘                │
+#                         │ │                   │ (MCLE Parameters)                │
+#                         ▼ ▼                   ▼                                  │
+#                   ┌───────────────────────────────────────────────┐              │
+#                   │       CurvatureAdjustmentCalculator           │              │
+#                   └───────────────────────────┬───────────────────┘              │
+#                                               │                                  │
+#              (Curvature Adjustment Matrix C)  │                                  │
+#                                               ▼                                  ▼
+#            ┌──────────────────────────────────────────────────────────────────┐
+#            │                      MCMC Sampling Pipeline                      │
+#            │   ┌──────────────────┐  ┌─────────────┐  ┌───────────────────┐   │
+#            │   │  ProposalKernel  │  │ MCMCPriors  │─►│    MCMCSampler    │   │
+#            │   └────────┬─────────┘  └─────────────┘  └─────────▲─────────┘   │
+#            │            └───────────────────────────────────────┘             │
+#            └──────────────────────────────────────────────────────────────────┘
+
+
+
+# =================== Data Preprocessing classes relationship diagram ===============
+#
+#   ┌────────────────┐ (passed to)  ┌────────────────────────┐
+#   │ SpeciesNetwork │─────────────►│ DisplayedTreeExtractor │
+#   └───────┬────────┘              └──────────┬─────────────┘
+#           │                                  │
+#           │ (network)                        │ (major_tree)
+#           ▼                                  ▼
+#   ┌────────────────────────────────────────────────────────┐
+#   │                QuartetFeatureExtractor                 │
+#   └──────────────────────────┬─────────────────────────────┘
+#                              │
+#                              │ (add seq_data row indices)
+#                              ▼
+#   ┌────────────────────────────────────────────────────────┐
+#   │                  QuartetFeaturePairer                  │
+#   └──────────────────────────┬─────────────────────────────┘
+#                              │
+#   ┌───────────────────────┐  │
+#   │ SequenceDataProcessor │  │
+#   └──────────┬────────────┘  │
+#              │               │
+#              │ (id_code,n_D) │
+#              ▼               ▼
+#   ┌────────────────────────────────────────────────────────┐
+#   │                   SitePatternCounter                   │
+#   └──────────────────────────┬─────────────────────────────┘
+#                              │
+#                              │ (outputs data-classes: FullSitePatterns, QuartetData)
+#                              │
+# ============================ │ =========================================================================
+#                              │ === Data classes relationship diagram ===
+#                              │
+#                              │    ┌──────────────┐    ┌──────────────┐
+#                              │    │ AsymmQuartet │    │ SymmQuartet  │
+#                              │    └──────┬───────┘    └──────┬───────┘
+#                              │           │  (subclasses of)  │
+#                              │           └──────────┬────────┘
+#                              │                      │
+#                              │                      ▼
+#                              │            ┌────────────────────┐
+#                              │            │ QuartetTreeTopology│
+#                              │            └─────────┬──────────┘
+#                              │                      │
+#                              │                 (is part of)
+#                              │                      │
+#                              │                      ▼
+#                              │            ┌────────────────────┐
+#                              │            │ QuartetTreeFeature │
+#                              │            └─────────┬──────────┘
+#                              │                      │
+#                              │                (subclass of)
+#                              │                      │
+#                              │                      ▼
+#                              │            ┌────────────────────┐
+#                              │            │   QuartetFeature   │
+#                              │            └─────────┬──────────┘
+#                              │                      │
+#                              │                (subclass of)
+#                              │                      │
+#                              │                      ▼
+#                              │            ┌────────────────────┐
+#                              │            │PairedQuartetFeature│
+#                              │            └─────────┬──────────┘
+#                              │                      │ (Encapsulated by SitePatternCounter)
+#                              │                      │
+#                              │                      │
+#                              │                      │
+#                              ├────────────────┐     │
+#                              ▼                ▼     ▼
+#           ┌─────────────────────┐    ┌──────────────────┐      ┌────────────────┐  ┌────────────────┐
+#           │  FullSitePatterns   │    │   QuartetData    │      │ TreeParameters │  │ GammaParameters│
+#           └─────────────┬───────┘    └──┬───┬───────┬───┘      └───────┬────────┘  └───────┬────────┘
+#                         │               │   │       │                  │  (subclasses of)  │
+#                         │               │   │       │                  └──────────┬────────┘
+#                         │               │   │       │                             │
+#                         │               │   │       │                             ▼
+#                         │               │   │       │                  ┌────────────────────┐
+#                         │ ┌─────────────┘   │       │                  │ NetworkParameters  │
+#                         │ │                 │       │                  └──────────────┬─────┘
+#                         │ │ ┌───────────────┘       └───────────────────────┐         │
+#                         │ │ │                                               │         │
+# ======================= │ │ │ ==== Utility classes relationship diagram === │ ======= │ ==========================
+#                         │ │ │                                               │         │
+#                         │ │ │  ┌──────────────────────┐                     ▼         ▼
+#                         │ │ │  │ ParameterTransformer │────┐          ┌────────────────────────┐
+#                         │ │ │  └──────────────────────┘    │ ┌────────│get_network_comp_log_lik│
+#                         │ │ │  ┌───────────────────────┐   │ │        └──────────┬─────────────┘
+#                         │ │ │  │ TauPriorTauConstraint │─┐ │ │                   │
+#                         │ │ │  └───────────────────────┘ │ │ │                   │
+#                         │ │ │  ┌──────────────┐          │ │ │                   │
+#                         │ │ │  │ MOMEstimator │────────┐ │ │ │                   │
+#                         │ │ │  └──────────────┘        │ │ │ │                   │
+#                         │ │ │                          ▼ ▼ ▼ ▼                   │
+#                         │ │ │   ┌───────────────────────────────┐                │
+#                         │ │ └──►│           Optimizer           │                │
+#                         │ │     └─────────────┬─────────────────┘                │
+#                         │ │                   │ (MCLE Parameters)                │
+#                         ▼ ▼                   ▼                                  │
+#                   ┌───────────────────────────────────────────────┐              │
+#                   │       CurvatureAdjustmentCalculator           │              │
+#                   └───────────────────────────┬───────────────────┘              │
+#                                               │                                  │
+#              (Curvature Adjustment Matrix C)  │                                  │
+#                                               ▼                                  ▼
+#                 ┌──────────────────────────────────────────────────────────────────┐
+#                 │                      MCMC Sampling Pipeline                      │
+#                 │   ┌──────────────────┐  ┌─────────────┐  ┌───────────────────┐   │
+#                 │   │  ProposalKernel  │  │ MCMCPriors  │─►│    MCMCSampler    │   │
+#                 │   └────────┬─────────┘  └─────────────┘  └─────────▲─────────┘   │
+#                 │            └───────────────────────────────────────┘             │
+#                 └──────────────────────────────────────────────────────────────────┘
 
 import numpy as np
 # np.set_printoptions(suppress=True, linewidth=np.nan)
@@ -94,15 +235,16 @@ import numpy as np
 ###############################
 ## Import required packages  ##
 ###############################
-import copy, re, phylox, dendropy, itertools, warnings
+import copy, re, phylox, dendropy, itertools, warnings, time
 import networkx as nx
 from abc import ABC, abstractmethod
-from phylox.constants import LABEL_ATTR
-from phylox import suppress_node
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from itertools import combinations, product
-from collections import Counter, defaultdict
+from phylox.constants import LABEL_ATTR
+from phylox import suppress_node
 from scipy.optimize import minimize
+from tqdm import trange
 
 ############################################
 ## Class for phylox network manipulation  ##
@@ -976,14 +1118,105 @@ class NetworkParameters:
             gamma_params=GammaParameters(values=np.asarray(gamma_vec))
         )
 
+    def copy(self):
+        """Returns a completely independent deep copy of this instance."""
+        return copy.deepcopy(self)
+    def __copy__(self):
+        return self.copy()
+
+    def _extract_array(self, other) -> np.ndarray:
+        """Helper to extract a 1D numpy array from self, another NetworkParameters, or an array."""
+        if isinstance(other, NetworkParameters):
+            return other.values
+        return np.asarray(other)
+
+    # -------------------------------------------------------------------------
+    # Arithmetic Operator Overloads (+, -, neg)
+    # -------------------------------------------------------------------------
+
+    def __add__(self, other):
+        """Supports: mcle + other (returns new NetworkParameters or np.ndarray)"""
+        other_arr = self._extract_array(other)
+        new_values = self.values + other_arr
+
+        # If adding two full parameter vectors of matching length, reconstruct NetworkParameters
+        if len(new_values) == self.total_params:
+            return NetworkParameters.from_vectors(
+                tree_vec=new_values[:self.num_tau + 1],
+                gamma_vec=new_values[self.num_tau + 1:] if self.num_retic > 0 else np.array([])
+            )
+        return new_values
+
+    def __radd__(self, other):
+        """Supports: other + mcle"""
+        return self.__add__(other)
+
+    def __sub__(self, other):
+        """Supports: mcle - other (returns new NetworkParameters or np.ndarray)"""
+        other_arr = self._extract_array(other)
+        new_values = self.values - other_arr
+
+        if len(new_values) == self.total_params:
+            return NetworkParameters.from_vectors(
+                tree_vec=new_values[:self.num_tau + 1],
+                gamma_vec=new_values[self.num_tau + 1:] if self.num_retic > 0 else np.array([])
+            )
+        return new_values
+
+    def __rsub__(self, other):
+        """Supports: other - mcle"""
+        other_arr = self._extract_array(other)
+        new_values = other_arr - self.values
+
+        if len(new_values) == self.total_params:
+            return NetworkParameters.from_vectors(
+                tree_vec=new_values[:self.num_tau + 1],
+                gamma_vec=new_values[self.num_tau + 1:] if self.num_retic > 0 else np.array([])
+            )
+        return new_values
+
+    def __neg__(self):
+        """Supports: -mcle"""
+        return NetworkParameters.from_vectors(
+            tree_vec=-self.tree_values,
+            gamma_vec=-self.gamma_values if self.num_retic > 0 else np.array([])
+        )
+
+    # -------------------------------------------------------------------------
+    # Array Slicing, Indexing & Representation
+    # -------------------------------------------------------------------------
+
+    def __getitem__(self, item):
+        """Allows direct indexing/slicing on the underlying values array (e.g., mcle[0] or mcle[:J])."""
+        return self.values[item]
+
+    def __setitem__(self, key, value):
+        """
+        Allows modifying values in-place via indexing/slicing (e.g., mcle[J] = new_theta or mcle[:J] = new_tau).
+        Keeps internal tree and gamma components synchronized.
+        """
+        # 1. Mutate the main values vector in-place
+        self.values[key] = value
+
+        # 2. Resync the underlying tree and gamma component objects
+        J = self.num_tau
+        self.tree_values = self.values[:J + 1]
+        self.tree.values = self.tree_values
+
+        if self.num_retic > 0:
+            self.gamma_values = self.values[J + 1:]
+            self.gamma.values = self.gamma_values
+
+    def __len__(self) -> int:
+        """Returns total number of parameters."""
+        return self.total_params
+
     def __repr__(self) -> str:
         """Controls how the object is displayed when evaluated in REPL / Jupyter."""
         return (
-            f"NetworkParameters(\n"
-            f"  tau={np.round(self.tree.tau, 6)},\n"
-            f"  theta={self.tree.theta:.6f},\n"
-            f"  gamma={np.round(self.gamma.values, 6)}\n"
-            f")"
+            f"(tau={np.round(self.tree.tau, 6)},"
+            f"  theta={self.tree.theta:.6f},"
+            f"  gamma={np.round(self.gamma.values, 6)})"
         )
 
 
@@ -2289,12 +2522,6 @@ class QuartetFeature:
         return copy.deepcopy(self)
     def __copy__(self):
         return self.copy()
-    def __deepcopy__(self, memo) -> "QuartetFeature":
-        """Support for standard library `copy.deepcopy()` calls."""
-        return QuartetFeature(
-            taxa=self.taxa,  # Tuples are immutable, no deep copy needed
-            tree_features=copy.deepcopy(self.tree_features, memo)
-        )
 
     @property
     def param_idx(self):
@@ -2835,7 +3062,7 @@ class SitePatternCounter:
 ## Compute composite likelihood of species network ##
 #####################################################
 
-def get_network_comp_log_lik(all_quartet_data: list[QuartetData,...],
+def get_network_comp_log_lik(all_quartet_data: list[QuartetData],
                               network_parameters: NetworkParameters):
     """Computes species network composite log likelihood."""
     comp_log_lik = 0
@@ -2849,7 +3076,7 @@ def get_network_comp_log_lik(all_quartet_data: list[QuartetData,...],
 ## Diagnosing quartet information for computing network composite likelihood ##
 ###############################################################################
 
-def printQuartet(all_quartet_data: list[QuartetData,...],
+def printQuartet(all_quartet_data: list[QuartetData],
                   network_parameters: NetworkParameters):
     """Print all information about every quartet subnetworks for checking errors."""
     for i, q_data in enumerate(all_quartet_data):
@@ -2873,7 +3100,7 @@ Quartet likelihood: {comp_log_lik}
 
 def log_beta(x, alpha, beta):
     """Computes kernals of log Beta distribution with shape alpha and scale beta."""
-    if not 0 <= x <= 1:
+    if not np.all((0 <= x) & (x <= 1)):
         return -np.inf
     return np.sum((alpha - 1) * np.log(x) * (beta - 1) * np.log(1 - x))
 
@@ -2938,7 +3165,7 @@ class ParameterTransformer:
 class MOMEstimator:
     """Computes Method of Moments (MOM) estimators for species network parameters."""
 
-    def __init__(self, network: "SpeciesNetwork", all_quartet_data: list[QuartetData,...]):
+    def __init__(self, network: "SpeciesNetwork", all_quartet_data: list[QuartetData]):
         self.network = network
         self.num_tau = network.num_tau
         self.all_quartet_data = all_quartet_data
@@ -3081,7 +3308,7 @@ class Optimizer:
     """Finds maximum composite likelihood estimator (MCLE) of network composite likelihood"""
 
     def __init__(self, network: SpeciesNetwork,
-                 all_quartet_data: list[QuartetData,...]):
+                 all_quartet_data: list[QuartetData]):
         self.network = network
         self.all_quartet_data = all_quartet_data
         # Labeled network copy for parameter index lookup
@@ -3338,7 +3565,7 @@ class CurvatureAdjustmentCalculator:
     """Finds curvature adjustment matrix C for network composite likelihood"""
 
     def __init__(self, mcle_net_params: NetworkParameters,
-                 all_quartet_data: list[QuartetData,...],
+                 all_quartet_data: list[QuartetData],
                  full_site_pattern: FullSitePatterns):
         self.network_parameters = mcle_net_params
         self.all_quartet_data = all_quartet_data
@@ -3408,427 +3635,270 @@ class CurvatureAdjustmentCalculator:
 ## Code Metropolis-within-Gibbs sampling algorithm ##
 #####################################################
 
-def proposal_kernel(current_values, step_width, boundaries, type=None):
-    """Reference (Yang 2014, page 222~225)"""
-    is_scalar = np.isscalar(current_values) or np.ndim(current_values) == 0
-    # Ensure inputs are standard numpy arrays for the math
-    current_values = np.atleast_1d(current_values)
-    boundaries = np.atleast_2d(boundaries)
-    sample_size = current_values.size
-    w = step_width
+class ProposalKernel:
+    """
+    Handles proposal step generation and boundary reflections for MCMC sampling.
+    References: Yang (2014, pp. 222–225).
+    """
+    VALID_TYPES = {"normal", "uniform", "Bactrian"}
 
-    # Check sizes of user input
-    if sample_size != boundaries.shape[0]:
-        raise ValueError("Size of current_value does not match rows of boundaries")
+    def __init__(self, kernel_type: str = "normal", bactrian_m: float = 0.95):
+        if kernel_type not in self.VALID_TYPES:
+            raise ValueError(f"Invalid distribution type '{kernel_type}'. Choose from {self.VALID_TYPES}.")
+        self.kernel_type = kernel_type
+        self.bactrian_m = bactrian_m
 
-    # Propose values
-    if type == "normal" or type is None:  # Default proposal kernal is normal
-        proposal_val = current_values + np.random.normal(0, w, size=sample_size)
-    elif type == "uniform":
-        proposal_val = current_values+ np.random.uniform(-w / 2, w / 2, size=sample_size)
-    elif type == "Bactrian":
-        m = 0.95
-        bactrian_noise = (2 * np.random.binomial(1, 0.5, size=sample_size) - 1) * m + \
-                          np.random.normal(size=sample_size) * np.sqrt(1 - m ** 2)
-        proposal_val = current_values + bactrian_noise * w
-    else:
-        raise ValueError("Invalid distribution type. Choose 'uniform', 'normal', or 'Bactrian'.")
+    def propose(self, current_values: np.ndarray, step_width: float, boundaries: np.ndarray):
+        """
+        Generates proposed parameter values and applies vectorized boundary reflection.
+        """
+        is_scalar = np.isscalar(current_values) or np.ndim(current_values) == 0
+        current_arr = np.atleast_1d(current_values)
+        bounds_arr = np.atleast_2d(boundaries)
+        sample_size = current_arr.size
 
-    # ------ Vectorized Boundary Reflection ------
-    # Extract lower and upper bounds as 1D arrays
-    lwr_b = boundaries[:, 0]
-    upr_b = boundaries[:, 1]
+        if sample_size != bounds_arr.shape[0]:
+            raise ValueError("Size of current_values does not match rows of boundaries.")
 
-    # As long as ANY value is outside its bounds, apply reflections
-    while np.any((proposal_val < lwr_b) | (proposal_val > upr_b)):
-        # "under" finds proposal_val that are below the lower bounds "a" and bounce it up
-        under = proposal_val < lwr_b
-        proposal_val[under] = 2 * lwr_b[under] - proposal_val[under]
+        # 1. Generate Raw Proposal
+        if self.kernel_type == "normal":
+            noise = np.random.normal(0, step_width, size=sample_size)
+            proposed = current_arr + noise
+        elif self.kernel_type == "uniform":
+            noise = np.random.uniform(-step_width / 2, step_width / 2, size=sample_size)
+            proposed = current_arr + noise
+        else: # elif self.kernel_type == "Bactrian":
+            m = self.bactrian_m
+            bactrian_noise = (2 * np.random.binomial(1, 0.5, size=sample_size) - 1) * m + \
+                             np.random.normal(size=sample_size) * np.sqrt(1 - m**2)
+            proposed = current_arr + bactrian_noise * step_width
 
-        # Find everything above the upper bounds and bounce it down
-        over = proposal_val > upr_b
-        proposal_val[over] = 2 * upr_b[over] - proposal_val[over]
+        # 2. Vectorized Boundary Reflection
+        lwr_b = bounds_arr[:, 0]
+        upr_b = bounds_arr[:, 1]
 
-    if is_scalar:
-        return float(proposal_val[0])
+        while np.any((proposed < lwr_b) | (proposed > upr_b)):
+            under = proposed < lwr_b
+            proposed[under] = 2 * lwr_b[under] - proposed[under]
 
-    return proposal_val
+            over = proposed > upr_b
+            proposed[over] = 2 * upr_b[over] - proposed[over]
 
+        if is_scalar:
+            return float(proposed[0])
 
-def MCMC_rawCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,     # species network info
-                        nsample, thin, step_width, prop_kern=None,               # MCMC settings
-                        thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,       # User costomized prior and MCLE
-                        prog_bar = None):                                       # show progress bar: yes/no
-    """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
-    get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
-    from tqdm import trange     # Included to show progress bar
-    import numpy as np
+        return proposed
 
-    h = len(phylox_network.reticulations)   # number of hybrids
-    J = len(phylox_network.leaves) + h - 1  # total number of tau parameters
+class MCMCPriors:
+    """Manages prior evaluation for network parameters (tau, theta, gamma)."""
 
-    if MCLE is None:
-        # Get MCLE of network parameters if user does not provide one
-        MCLE, _ = get_MCLE_parameters(zipped_data_net, phylox_network)
+    def __init__(self, tau_constraint: TauPriorTauConstraint,
+                 mcle_values: np.ndarray,
+                 theta_prior: tuple[float, float] | None = None,
+                 tau_prior: tuple[float, float] | None = None,
+                 gamma_prior: tuple[float, float] | None = None,
+                 num_tau: int = 0,
+                 num_retic: int = 0):
+        self.tau_constraint = tau_constraint
+        self.num_tau = num_tau
+        self.num_retic = num_retic
 
-    # initialize prior (inverse gamma distr) for tau
-    log_prior_tau, get_tau_boundaries, tau_in_constraints = get_tau_prior_and_constraint(phylox_network)
-    if thetaPr is None:
-        a_theta = 3                         # default alpha parameter for theta
-        b_theta = MCLE[J] * (a_theta - 1)   # default beta parameter for theta
-    else:
-        a_theta = thetaPr[0]  # user input alpha parameter for theta
-        b_theta = thetaPr[1]  # user input beta parameter for theta
+        # theta prior params
+        self.a_theta = theta_prior[0] if theta_prior else 3.0
+        self.b_theta = theta_prior[1] if theta_prior else float(mcle_values[num_tau] * (self.a_theta - 1))
 
-    # initialize prior (inverse gamma distr) for theta
-    if tauPr is None:
-        a_tau = 3                       # default alpha parameter for tau_root
-        b_tau = MCLE[0] * (a_tau - 1)   # default beta parameter for tau_root
-    else:
-        a_tau = tauPr[0]  # user input alpha parameter for tau_root
-        b_tau = tauPr[1]  # user input beta parameter for tau_root
+        # tau prior params (root age)
+        self.a_tau = tau_prior[0] if tau_prior else 3.0
+        self.b_tau = tau_prior[1] if tau_prior else float(mcle_values[0] * (self.a_tau - 1))
 
-    # initialize prior (beta distr) for gamma
-    gamma_bound = [[0,1]] * h
-    if gammaPr is None:
-        a_gamma = 1  # default alpha parameter for gamma
-        b_gamma = 1  # default beta parameter for gamma
-    else:
-        a_gamma = gammaPr[0]  # user input alpha parameter for gamma
-        b_gamma = gammaPr[1]  # user input beta parameter for gamma
+        # gamma prior params
+        self.a_gamma = gamma_prior[0] if gamma_prior else 1.0
+        self.b_gamma = gamma_prior[1] if gamma_prior else 1.0
 
-    # initialize acceptance counter
-    accept_count_tau = 0
-    accept_count_theta = 0
-    accept_count_gamma = 0
+    def log_prior_theta(self, theta):
+        if theta <= 0:
+            return -np.inf
+        return log_invgamma(theta, self.a_theta, self.b_theta)
 
-    # initialize parameter chain
-    MCMC_samples = []
-    curr_param = MCLE.copy()
-    # Calculate the starting states ONCE before the loop begins. Update them only when proposal accepted.
-    curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_param)
+    def log_prior_tau(self, tau: np.ndarray):
+        return self.tau_constraint.log_prior_tau(tau, self.a_tau, self.b_tau)
 
-    # Progress bar setup
-    total_iter = int(nsample * thin)
-    if prog_bar is None or prog_bar:
-        iter_range = trange(total_iter, desc="MCMC raw CL")
-    else:
-        iter_range = range(total_iter)
+    def log_prior_gamma(self, gamma: np.ndarray):
+        if np.any((gamma < 0.0) | (gamma > 1.0)):
+            return -np.inf
+        return log_beta(gamma, self.a_gamma, self.b_gamma)
 
-    for iteration in iter_range:
-        # Step 1: Sampling theta
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_loglik have been calculated before Step 1
-        curr_logprior = log_invgamma(curr_param[J], a_theta,b_theta)
-        new_param[J] = proposal_kernel(curr_param[J], step_width[1], (5e-5, 0.2), prop_kern)
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
-        new_logprior = log_invgamma(new_param[J], a_theta,b_theta)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior+new_loglik - curr_logprior-curr_loglik:
-            curr_param[J] = new_param[J] # accept new proposal and update it
-            curr_loglik = new_loglik     # Carry accepted loglik forward
-            accept_count_theta += 1
-        # else reject the new_theta proposal
+class MCMCSampler:
+    """
+    Executes MCMC sampling over species network parameters (raw or curvature-adjusted).
+    """
 
-        # Step 2: Sampling tau
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_loglik have been updated before Step 2
-        curr_logprior = log_prior_tau(curr_param[:J], a_tau,b_tau)
-        new_param[:J] = proposal_kernel(curr_param[:J], step_width[0], get_tau_boundaries(curr_param[:J]), prop_kern)
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
-        new_logprior = log_prior_tau(new_param[:J], a_tau,b_tau)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-            curr_param[:J] = new_param[:J]  # accept new proposal and update it
-            curr_loglik = new_loglik        # Carry accepted loglik forward
-            accept_count_tau += 1
-        # else reject the new_tau proposal
+    def __init__(self, network: SpeciesNetwork,
+                 compressed_quartet_data: list[QuartetData]):
+        self.network = network
+        self.compressed_quartet_data = compressed_quartet_data
+        # Basic dimensions
+        self.num_tau = network.num_tau
+        self.num_retic = network.num_retic
+        self.total_params = self.num_tau + 1 + self.num_retic
+        # Associated helper instances
+        self.tau_constraint = TauPriorTauConstraint(network)
 
-        # Step 3: Sampling gamma
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_loglik have been updated before Step 3
-        curr_logprior = log_beta(curr_param[-h:], a_gamma, b_gamma)
-        new_param[-h:] = proposal_kernel(curr_param[-h:], step_width[2], gamma_bound, prop_kern)
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_param)
-        new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-            curr_param[-h:] = new_param[-h:]  # accept new proposal and update it
-            curr_loglik = new_loglik        # Carry accepted loglik forward
-            accept_count_gamma += 1
-        # else reject the new_gamma proposal
+    def _evaluate_log_lik(self, raw_params):
+        """Evaluates composite log-likelihood given a 1D raw parameters array."""
+        if not isinstance(raw_params, NetworkParameters):
+            tree_vec = raw_params[:self.num_tau + 1]
+            gamma_vec = raw_params[self.num_tau + 1:] if self.num_retic > 0 else np.array([])
+            net_params = NetworkParameters.from_vectors(tree_vec, gamma_vec)
+        else:
+            net_params = raw_params
+        return get_network_comp_log_lik(self.compressed_quartet_data, net_params)
 
-        # Step 4: store samples every 'thin'-th iteration
-        if iteration % thin == 0:
-            MCMC_samples.append(curr_param.copy())
-            # Step 5: Update progress bar postfix every 'thin'-th iteration
-            if prog_bar is None or prog_bar:
-                accept_ratio_tau = accept_count_tau / (iteration + 1)
-                accept_ratio_theta = accept_count_theta / (iteration + 1)
-                accept_ratio_gamma = accept_count_gamma / (iteration + 1)
-                iter_range.set_postfix(tau_Pjump=f"{accept_ratio_tau:.2f}", theta_Pjump=f"{accept_ratio_theta:.2f}",
-                                     gamma_Pjump=f"{accept_ratio_gamma:.2f}")
+    def run(self,
+            nsample: int,
+            thin: int,
+            step_width: list[float],
+            curv_adj: np.ndarray | None = None,
+            kernel_type: str = "normal",
+            mcle: NetworkParameters | None = None,
+            theta_prior: tuple[float, float] | None = None,
+            tau_prior: tuple[float, float] | None = None,
+            gamma_prior: tuple[float, float] | None = None,
+            show_progress_bar: bool = True) -> np.ndarray:
+        """
+        Runs the MCMC sampling loop.
 
-    # Calculate the acceptance ratio
-    accept_ratio_tau = accept_count_tau / total_iter
-    accept_ratio_theta = accept_count_theta / total_iter
-    accept_ratio_gamma = accept_count_gamma / total_iter
-    print(f"rawCL, P_jump of tau: {accept_ratio_tau:.3f}, P_jump of theta: {accept_ratio_theta:.3f}, P_jump of gamma: {accept_ratio_gamma:.3f}")
+        If `curv_adj` is provided, performs Curvature-Adjusted MCMC;
+        otherwise runs Raw Composite Likelihood MCMC.
+        """
+        # 1. Obtain starting MCLE parameters if not supplied
+        if mcle is None:
+            print("User did not provide MCLE. Estimating MCLE for species network...")
+            start_time = time.time()
+            optimizer = Optimizer(self.network, self.compressed_quartet_data)
+            mcle, _ = optimizer.get_MCLE_parameters()
+            end_time = time.time()
+            print(f"Finished estimating MCLE: {mcle} in {end_time - start_time:.2f} seconds.")
 
-    return np.array(MCMC_samples)
+        # 2. Initialize Helper Components
+        kernel = ProposalKernel(kernel_type=kernel_type if kernel_type else "normal")
+        priors = MCMCPriors(
+            tau_constraint=self.tau_constraint,
+            mcle_values=mcle.values,
+            theta_prior=theta_prior,
+            tau_prior=tau_prior,
+            gamma_prior=gamma_prior,
+            num_tau=self.num_tau,
+            num_retic=self.num_retic
+        )
 
+        use_curv = curv_adj is not None
+        C = np.asarray(curv_adj) if use_curv else None
 
-def MCMC_curvAdjCompLik(zipped_data_net, zipped_data_net_reduce, phylox_network,    # species network info
-                        nsample, thin, step_width, curvAdj, prop_kern=None,         # MCMC settings
-                        thetaPr=None, tauPr=None, gammaPr=None, MCLE=None,          # User costomized prior and MCLE
-                        prog_bar = None):                                       # show progress bar: yes/no
-    """We use zipped_data_net from get_parsed_data_net() to get MCLE and use zipped_data_net_compressed from
-    get_parsed_data_net_compressed() to compute likelihood for a faster computation during MCMC runs."""
-    from tqdm import trange     # Included to show progress bar
-    import numpy as np
+        # 3. Setup Initial State
+        curr_param = mcle.copy()
+        if use_curv:
+            curr_star = curr_param # = mcle.values + C @ (curr_param - mcle.values)
+            curr_loglik = self._evaluate_log_lik(curr_star)
+        else:
+            curr_loglik = self._evaluate_log_lik(curr_param)
 
-    h = len(phylox_network.reticulations)   # number of hybrids
-    J = len(phylox_network.leaves) + h - 1  # total number of tau parameters
+        accept_tau, accept_theta, accept_gamma = 0, 0, 0
+        MCMC_samples = []
 
-    if MCLE is None:
-        # Get MCLE of network parameters if user does not provide one
-        MCLE, _ = get_MCLE_parameters(zipped_data_net, phylox_network)
+        total_iter = int(nsample * thin)
+        desc_str = "MCMC Curv-Adj CL" if use_curv else "MCMC Raw CL"
+        iter_range = trange(total_iter, desc=desc_str) if show_progress_bar else range(total_iter)
 
-    # initialize prior (inverse gamma distr) for tau
-    log_prior_tau, get_tau_boundaries, tau_in_constraints = get_tau_prior_and_constraint(phylox_network)
-    if thetaPr is None:
-        a_theta = 3                         # default alpha parameter for theta
-        b_theta = MCLE[J] * (a_theta - 1)   # default beta parameter for theta
-    else:
-        a_theta = thetaPr[0]  # user input alpha parameter for theta
-        b_theta = thetaPr[1]  # user input beta parameter for theta
+        J = self.num_tau
+        h = self.num_retic
+        gamma_bound = np.tile([0.0, 1.0], (h, 1)) if h > 0 else np.empty((0, 2))
 
-    # initialize prior (inverse gamma distr) for theta
-    if tauPr is None:
-        a_tau = 3                       # default alpha parameter for tau_root
-        b_tau = MCLE[0] * (a_tau - 1)   # default beta parameter for tau_root
-    else:
-        a_tau = tauPr[0]  # user input alpha parameter for tau_root
-        b_tau = tauPr[1]  # user input beta parameter for tau_root
+        # 4. Main MCMC Sampling Loop
+        for iteration in iter_range:
 
-    # initialize prior (beta distr) for gamma
-    gamma_bound = [[0,1]] * h
-    if gammaPr is None:
-        a_gamma = 1  # default alpha parameter for gamma
-        b_gamma = 1  # default beta parameter for gamma
-    else:
-        a_gamma = gammaPr[0]  # user input alpha parameter for gamma
-        b_gamma = gammaPr[1]  # user input beta parameter for gamma
+            # --- Step 1: Sample Theta ---
+            new_param = curr_param.copy()
+            curr_logprior = priors.log_prior_theta(curr_param[J])
 
-    # initialize acceptance counter
-    accept_count_tau = 0
-    accept_count_theta = 0
-    accept_count_gamma = 0
+            if use_curv:
+                while True:
+                    new_param[J] = kernel.propose(curr_param[J], step_width[1], np.array([[5e-5, 0.2]]))
+                    new_star = mcle + C @ (new_param - mcle)
+                    if self.tau_constraint.tau_in_constraints(new_star[:J]) and new_star[J] > 0:
+                        break
+                new_loglik = self._evaluate_log_lik(new_star)
+            else:
+                new_param[J] = kernel.propose(curr_param[J], step_width[1], np.array([[5e-5, 0.2]]))
+                new_loglik = self._evaluate_log_lik(new_param)
 
-    # initialize parameter chain
-    MCMC_samples = []
-    curr_param = MCLE.copy()
-    C = np.asarray(curvAdj)
-    # Calculate the starting states ONCE before the loop begins. Update them only when proposal accepted.
-    curr_star = MCLE + C @ (curr_param - MCLE)
-    curr_loglik = get_network_comp_log_lik(zipped_data_net_reduce, curr_star)
+            new_lp = priors.log_prior_theta(new_param[J])
+            if np.log(np.random.rand()) < (new_lp + new_loglik - curr_logprior - curr_loglik):
+                curr_param[J] = new_param[J]
+                curr_loglik = new_loglik
+                accept_theta += 1
 
-    # Progress bar setup
-    total_iter = int(nsample * thin)
-    if prog_bar is None or prog_bar:
-        iter_range = trange(total_iter, desc="MCMC curvAdjust_matrix CL")
-    else:
-        iter_range = range(total_iter)
+            # --- Step 2: Sample Tau ---
+            new_param = curr_param.copy()
+            curr_logprior = priors.log_prior_tau(curr_param[:J])
 
-    for iteration in iter_range:
-        # Step 1: Sampling theta
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_star & curr_loglik have been calculated before Step 1
-        curr_logprior = log_invgamma(curr_param[J], a_theta,b_theta)
-        while True:
-            new_param[J] = proposal_kernel(curr_param[J], step_width[1], (5e-5,0.2), prop_kern)
-            new_star = MCLE + C @ (new_param - MCLE)
-            if tau_in_constraints(new_star[:J]) and new_star[J]>0:
-                break
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-        new_logprior = log_invgamma(new_param[J], a_theta,b_theta)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior+new_loglik - curr_logprior-curr_loglik:
-            curr_param[J] = new_param[J] # accept new proposal and update it
-            curr_loglik = new_loglik     # Carry accepted loglik forward
-            accept_count_theta += 1
-        # else reject the new_theta proposal
+            if use_curv:
+                while True:
+                    tau_bounds = self.tau_constraint.get_tau_boundaries(curr_param[:J])
+                    new_param[:J] = kernel.propose(curr_param[:J], step_width[0], tau_bounds)
+                    new_star = mcle + C @ (new_param - mcle)
+                    if self.tau_constraint.tau_in_constraints(new_star[:J]) and new_star[J] > 0:
+                        break
+                new_loglik = self._evaluate_log_lik(new_star)
+            else:
+                tau_bounds = self.tau_constraint.get_tau_boundaries(curr_param[:J])
+                new_param[:J] = kernel.propose(curr_param[:J], step_width[0], tau_bounds)
+                new_loglik = self._evaluate_log_lik(new_param)
 
-        # Step 2: Sampling tau
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_loglik have been updated before Step 2
-        curr_logprior = log_prior_tau(curr_param[:J], a_tau,b_tau)
-        while True:
-            new_param[:J] = proposal_kernel(curr_param[:J], step_width[0], get_tau_boundaries(curr_param[:J]), prop_kern)
-            new_star = MCLE + C @ (new_param - MCLE)
-            if tau_in_constraints(new_star[:J]) and new_star[J]>0:
-                break
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-        new_logprior = log_prior_tau(new_param[:J], a_tau,b_tau)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-            curr_param[:J] = new_param[:J]  # accept new proposal and update it
-            curr_loglik = new_loglik        # Carry accepted loglik forward
-            accept_count_tau += 1
-        # else reject the new_tau proposal
+            new_lp = priors.log_prior_tau(new_param[:J])
+            if np.log(np.random.rand()) < (new_lp + new_loglik - curr_logprior - curr_loglik):
+                curr_param[:J] = new_param[:J]
+                curr_loglik = new_loglik
+                accept_tau += 1
 
-        # Step 3: Sampling gamma
-        new_param = curr_param.copy() # RESET new_param to current accepted state
-        # curr_loglik have been updated before Step 3
-        curr_logprior = log_beta(curr_param[-h:], a_gamma, b_gamma)
-        while True:
-            new_param[-h:] = proposal_kernel(curr_param[-h:], step_width[2], gamma_bound, prop_kern)
-            new_star = MCLE + C @ (new_param - MCLE)
-            if tau_in_constraints(new_star[:J]) and new_star[J] > 0:
-                break
-        new_loglik = get_network_comp_log_lik(zipped_data_net_reduce, new_star)
-        new_logprior = log_beta(new_param[-h:], a_gamma, b_gamma)
-        # accept or reject new proposal
-        if np.log(np.random.rand()) < new_logprior + new_loglik - curr_logprior - curr_loglik:
-            curr_param[-h:] = new_param[-h:]  # accept new proposal and update it
-            curr_loglik = new_loglik        # Carry accepted loglik forward
-            accept_count_gamma += 1
-        # else reject the new_gamma proposal
+            # --- Step 3: Sample Gamma ---
+            if h > 0:
+                new_param = curr_param.copy()
+                curr_logprior = priors.log_prior_gamma(curr_param[-h:])
 
-        # Step 4: store samples every 'thin'-th iteration
-        if iteration % thin == 0:
-            MCMC_samples.append(curr_param.copy())
-            # Step 5: Update progress bar postfix every 'thin'-th iteration
-            if prog_bar is None or prog_bar:
-                accept_ratio_tau = accept_count_tau / (iteration + 1)
-                accept_ratio_theta = accept_count_theta / (iteration + 1)
-                accept_ratio_gamma = accept_count_gamma / (iteration + 1)
-                iter_range.set_postfix(tau_Pjump=f"{accept_ratio_tau:.2f}", theta_Pjump=f"{accept_ratio_theta:.2f}",
-                                     gamma_Pjump=f"{accept_ratio_gamma:.2f}")
+                if use_curv:
+                    while True:
+                        new_param[-h:] = kernel.propose(curr_param[-h:], step_width[2], gamma_bound)
+                        new_star = mcle + C @ (new_param - mcle)
+                        if self.tau_constraint.tau_in_constraints(new_star[:J]) and new_star[J] > 0:
+                            break
+                    new_loglik = self._evaluate_log_lik(new_star)
+                else:
+                    new_param[-h:] = kernel.propose(curr_param[-h:], step_width[2], gamma_bound)
+                    new_loglik = self._evaluate_log_lik(new_param)
 
-    # Calculate the acceptance ratio
-    accept_ratio_tau = accept_count_tau / total_iter
-    accept_ratio_theta = accept_count_theta / total_iter
-    accept_ratio_gamma = accept_count_gamma / total_iter
-    print(f"adjCL, P_jump of tau: {accept_ratio_tau:.3f}, P_jump of theta: {accept_ratio_theta:.3f}, P_jump of gamma: {accept_ratio_gamma:.3f}")
+                new_lp = priors.log_prior_gamma(new_param[-h:])
+                if np.log(np.random.rand()) < (new_lp + new_loglik - curr_logprior - curr_loglik):
+                    curr_param[-h:] = new_param[-h:]
+                    curr_loglik = new_loglik
+                    accept_gamma += 1
 
-    return np.array(MCMC_samples)
+            # --- Step 4: Record Thinning & Update Diagnostics ---
+            if iteration % thin == 0:
+                MCMC_samples.append(curr_param.copy())
+                if show_progress_bar and hasattr(iter_range, "set_postfix"):
+                    denom = iteration + 1
+                    iter_range.set_postfix(
+                        tau_Pjump=f"{accept_tau / denom:.2f}",
+                        theta_Pjump=f"{accept_theta / denom:.2f}",
+                        gamma_Pjump=f"{accept_gamma / denom:.2f}"
+                    )
 
+        # Print final acceptance ratios
+        p_jump_tau = accept_tau / total_iter
+        p_jump_theta = accept_theta / total_iter
+        p_jump_gamma = accept_gamma / total_iter
+        label = "adjCL" if use_curv else "rawCL"
+        print(f"\n{label}, P_jump tau: {p_jump_tau:.3f}, theta: {p_jump_theta:.3f}, gamma: {p_jump_gamma:.3f}")
 
-####################################################################
-## Compute modified composite likelihood ratio statistics (mCLRT) ##
-####################################################################
-
-def modified_CompLik_ratio_stat(zipped_data_net, all_E_mat, n_D, phylox_network, gamma_test=None):
-    """Compute the modified composite likelihood ratio statistics (Chen et al. 2018) given user input a boolean
-    vector gamma_test:
-    gamma_test = [True]         -> H0: γ_1=0 vs Ha: γ_1∈(0,0.5]
-    gamma_test = [True, True]   -> H0: γ_1=γ_2=0 vs Ha: at least one γ_i∈(0,0.5] for i=1,2.
-    gamma_test = [True, False]  -> H0: γ_1=0 vs Ha: γ_1∈(0,0.5]"""
-
-    from numpy.linalg import inv
-    from scipy.optimize import minimize
-    # -------------------------------------------------------------------------
-    # 1. Precompute matrices needed for later computation
-    # -------------------------------------------------------------------------
-    # L = sum(n_D)                            # Sample size
-    N = len(phylox_network.leaves)         # Number of taxa
-    h = len(phylox_network.reticulations)  # Number of hybridizations
-
-    # Get unconstrained MCLE
-    MCLE, CL_opt = get_MCLE_parameters(zipped_data_net, phylox_network)
-    gamma_hat_c = MCLE[-h:]
-
-    # Get constrained MCLE where some gamma_j are fixed at zero
-    if gamma_test is None:
-        gamma_test = np.full(h, True)
-    is_fixed_param = np.append(np.full(N + h, False), gamma_test)
-    MCLE_cons, CL_cons = get_MCLE_parameters(zipped_data_net, phylox_network, is_fixed_param)
-
-    # Get estimates of U_pc, J_p and H_p according to p.8 of Supplementary Material of Chen et al. (2018)
-    U_c, J_hat, H_hat = get_Score_Vari_Sens_Mat(MCLE, zipped_data_net, all_E_mat, n_D)
-    U_e = U_c[:-h]                  # U_{\eta}
-    U_g = U_c[-h:]                  # U_{\gamma}
-    H_ee = H_hat[:-h, :-h] #/ L      # H_{\eta\eta}
-    H_ge = H_hat[-h:, :-h] #/ L      # H_{\gamma\eta}
-    H_gg = H_hat[-h:, -h:] #/ L      # H_{\gamma\gamma}
-    K_mat = H_ge @ inv(H_ee)        # H_{\gamma\eta} \times H_{\eta\eta}^{-1}
-    J_ee = J_hat[:-h, :-h] #/ L      # J_{\eta\eta}
-    J_ge = J_hat[-h:, :-h] #/ L      # J_{\gamma\eta}
-    J_gg = J_hat[-h:, -h:] #/ L      # J_{\gamma\gamma}
-    U_pc = U_g - K_mat @ U_e
-    H_p = H_gg - K_mat @ H_ge.T
-    J_p = J_gg + K_mat @ J_ee @ K_mat.T - K_mat @ J_ge.T - (K_mat @ J_ge.T).T
-    # # Naive estimators
-    # U_pc = U_g
-    # H_p = H_gg
-    # J_p = J_gg
-
-    # Precompute H_p^{-1} and H_pA
-    H_p_inv = inv(H_p)
-    H_pA = H_p @ inv(J_p) @ H_p
-
-    # -------------------------------------------------------------------------
-    # 2. Functions used to compute modified composite likelihood ratio statistics: T_p(γ), ϕ_p(γ), l_MP(γ)
-    # -------------------------------------------------------------------------
-    def T_p(gamma):
-        return H_p_inv @ U_pc - np.matrix(gamma - gamma_hat_c).T
-        # return 1/np.sqrt(L) * H_p_inv @ U_pc - np.sqrt(L) * np.matrix(gamma - gamma_hat_c).T
-
-    def phi_p(params):
-        """𝜼 = (τ_1,...,τ_{N+h-1},θ) and γ = (γ_1,...,γ_h) are evaluated jointly in this function so that
-        we can jointly optimize 𝜼 and γ in l_MP(𝜼,γ)."""
-        gamma = params[-h:]
-        numerator = get_network_comp_log_lik(zipped_data_net, params) - CL_opt
-        denominator = (- T_p(gamma).T @ H_p @ T_p(gamma) + U_pc.T @ H_p_inv @ U_pc)[0,0]
-        phi_p = numerator / denominator if numerator != 0 else 1/2
-        return phi_p
-        # return numerator / (- T_p(gamma).T @ H_p @ T_p(gamma) + 1/L * U_pc.T @ H_p_inv @ U_pc)[0,0]
-
-    def l_MP(params):
-        """𝜼 = (τ_1,...,τ_{N+h-1},θ) and γ = (γ_1,...,γ_h) are evaluated jointly in this function so that
-        we can jointly optimize l_MP(𝜼,γ) to find hat{γ}_M."""
-        gamma = params[-h:]
-        return - (T_p(gamma).T @ H_pA @ T_p(gamma))[0,0] * phi_p(params)
-
-    # -------------------------------------------------------------------------
-    # 3. Find optimized l_MP(hat{γ}_M)
-    # -------------------------------------------------------------------------
-    labeled_network = phylox_network.copy()
-    label_speciation_time_idx(labeled_network)
-
-    def neg_l_MP(trans_param):
-        if not np.all(np.isfinite(trans_param)):
-            return np.inf
-
-        params = parameter_backtransform(trans_param, labeled_network)
-
-        if not np.all(np.isfinite(params)):
-            return np.inf
-        if np.any(params < 0):
-            return np.inf
-
-        try:
-            return -l_MP(params)
-        except FloatingPointError:
-            print("Floating point error at x =", trans_param)
-            raise
-
-    x0 = parameter_transform(np.mean([MCLE,MCLE_cons], axis=0), labeled_network)
-    result = minimize(neg_l_MP, x0, method="BFGS",
-                      options=dict(gtol=1e-12, maxiter=10000))
-    l_MP_opt = -result.fun
-    MCLE_M = parameter_backtransform(result.x, labeled_network)
-
-    # -------------------------------------------------------------------------
-    # 4. Calculate modified profile composite likelihood ratio statistics and the degree of freedom for 𝜒^2
-    # -------------------------------------------------------------------------
-    mpCLRT = -2 * (l_MP(MCLE_cons) - l_MP_opt)
-
-    # mpCLRT follows chi-square with degrees of freedom = V
-    threshold = 1e-6
-    V = np.sum((threshold < MCLE_M[-h:]) & (MCLE_M[-h:] < (0.5 - threshold)))
-
-    # return the modified profile composite likelihood ratio statistics and the degree of freedom
-    return mpCLRT, V
-
+        return np.array(MCMC_samples)
